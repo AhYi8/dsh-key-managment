@@ -4,9 +4,9 @@
  * - 会话页右上角 utilities slot 注册钥匙按钮,弹出悬浮框:
  *   自定义供应商下拉(含取消纳管)、密钥列表(无边框图标按钮,
  *   每行按钮组最左侧圆环余额,tooltip 式明细弹层带立即刷新,
- *   删除走 tooltip 式二次确认)、添加密钥、刷新扫描、可纳管常驻区;
- * - 设置页供应商卡片注册"已纳入管理"徽标;
- * - 插件详情页注册配置卡(plugins.row.config):余额探测开关 + 探测间隔。
+ *   删除走 tooltip 式二次确认)、添加密钥、刷新扫描、可纳管常驻区、
+ *   后台探测设置(探测开关 + 轮间隔 + 组内间隔,折叠在面板底部);
+ * - 设置页供应商卡片注册"已纳入管理"徽标。
  *
  * 数据走 Host 半区的同源 HTTP 路由(POST JSON),不引宿主 UI 原语包,
  * 控件按宿主主题令牌(--dsw-alias-*)自绘。
@@ -31,6 +31,7 @@ window.__ModuleLoader__.load({
       close: 'M6 6l12 12M18 6L6 18',
       chevron: 'M6 9l6 6 6-6',
       check: 'M5 12l5 5L20 7',
+      tune: 'M4 7h8M16 7h4M4 17h4M12 17h8M14 4v6M8 14v6',
     }
 
     function Icon(props) {
@@ -524,8 +525,8 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 悬浮框主体;props.align 决定面板展开方向(left=向右展开/默认 right)。 */
-    function PoolPanel(props) {
+    /** 悬浮框主体。 */
+    function PoolPanel() {
       const [state, setState] = useState(null)
       const [error, setError] = useState('')
       const [busy, setBusy] = useState(false)
@@ -1038,13 +1039,15 @@ window.__ModuleLoader__.load({
         }
         if (availableBlock) children.push(availableBlock)
       }
+      // 后台探测设置:与供应商无关,始终挂在面板底部。
+      children.push(h(ProbeConfigSection))
 
       return h('div', {
         style: {
           position: 'absolute',
           top: 'calc(100% + 6px)',
-          // 对齐方向:头部按钮(right,贴屏幕右缘)与侧栏按钮(left,向右展开)不同。
-          ...(props.align === 'left' ? { left: 0 } : { right: 0 }),
+          // 面板贴屏幕右缘展开(按钮在会话头部右侧)。
+          right: 0,
           width: 390,
           maxHeight: 540,
           overflowY: 'auto',
@@ -1064,8 +1067,8 @@ window.__ModuleLoader__.load({
       }, children)
     }
 
-    /** 头部工具按钮 + 悬浮框容器;align 决定面板展开方向。 */
-    function PoolButton(props) {
+    /** 头部工具按钮 + 悬浮框容器。 */
+    function PoolButton() {
       const [open, setOpen] = useState(false)
       const containerRef = useRef(null)
       useOutside(open, containerRef, () => setOpen(false))
@@ -1088,13 +1091,8 @@ window.__ModuleLoader__.load({
           },
         },
         h(Icon, { name: 'key', size: 16 })),
-        open ? h(PoolPanel, { align: props.align }) : null,
+        open ? h(PoolPanel) : null,
       )
-    }
-
-    /** 侧栏常驻入口:面板向右展开。 */
-    function SidebarPoolButton() {
-      return h(PoolButton, { align: 'left' })
     }
 
     /**
@@ -1143,19 +1141,26 @@ window.__ModuleLoader__.load({
       return Math.min(60_000, Math.max(200, Math.round(number / 100) * 100))
     }
 
-    /** 插件详情页配置卡:探测开关 + 后台间隔 + 组内间隔。 */
-    function ConfigCard() {
+    /**
+     * 后台探测设置(收在悬浮框内):探测开关 + 轮间隔 + 组内间隔。
+     * 默认折叠:悬浮框主体是密钥列表,探测配置属于低频操作。
+     */
+    function ProbeConfigSection() {
+      const [open, setOpen] = useState(false)
       const [values, setValues] = useState(null)
       const [error, setError] = useState('')
       const [saved, setSaved] = useState(false)
       const mounted = useRef(true)
       // 卸载守卫:异步回包晚于卸载时不再 setState(审查 P2-7)。
       useEffect(() => () => { mounted.current = false }, [])
+      // 展开时才拉配置:打开悬浮框本身不额外发请求。
       useEffect(() => {
+        if (!open) return undefined
         let cancelled = false
         api('getConfig')
           .then(next => {
-            if (!cancelled) setValues({
+            if (cancelled) return
+            setValues({
               quotaProbe: next.quotaProbe,
               quotaIntervalMs: next.quotaIntervalMs,
               quotaProbeGapMs: next.quotaProbeGapMs,
@@ -1163,55 +1168,73 @@ window.__ModuleLoader__.load({
           })
           .catch(cause => { if (!cancelled) setError(cause?.message ?? String(cause)) })
         return () => { cancelled = true }
-      }, [])
+      }, [open])
       const save = async (patch) => {
         setError('')
         setSaved(false)
         try {
           const next = await api('setConfig', patch)
-          if (mounted.current) setValues({
+          if (!mounted.current) return
+          setValues({
             quotaProbe: next.quotaProbe,
             quotaIntervalMs: next.quotaIntervalMs,
             quotaProbeGapMs: next.quotaProbeGapMs,
           })
-          if (mounted.current) setSaved(true)
+          setSaved(true)
         } catch (cause) {
           if (mounted.current) setError(cause?.message ?? String(cause))
         }
       }
       const numberStyle = {
-        width: 90,
-        padding: '4px 8px',
+        width: 78,
+        padding: '3px 6px',
+        fontSize: 12,
         borderRadius: 6,
         border: '1px solid var(--dsw-alias-border-secondary, #333)',
         background: 'var(--dsw-alias-bg-secondary, transparent)',
         color: 'var(--dsw-alias-fg-primary, inherit)',
+        outline: 'none',
       }
-      return h('div', {
+      const toggle = h('button', {
+        onClick: () => setOpen(value => !value),
+        title: t('probeSettings'),
         style: {
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 10,
-          padding: 12,
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '3px 8px',
           fontSize: 12,
+          borderRadius: 6,
+          border: '1px solid var(--dsw-alias-border-secondary, #333)',
+          background: 'transparent',
+          color: 'var(--dsw-alias-fg-primary, inherit)',
+          cursor: 'pointer',
         },
       },
-      h('strong', { style: { fontSize: 13 } }, t('configTitle')),
-      error ? h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, error) : null,
-      values === null
-        ? h('div', { style: { opacity: 0.7 } }, t('loading'))
-        : h(React.Fragment, null,
+      h(Icon, { name: 'tune', size: 12 }),
+      h('span', { style: { flex: 1, textAlign: 'left' } }, t('probeSettings')),
+      h(Icon, { name: 'chevron', size: 11 }))
+
+      // 数组式构建:避免深层嵌套的括号错位。
+      const children = [toggle]
+      if (open) {
+        if (error) {
+          children.push(h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, error))
+        }
+        if (values === null) {
+          children.push(h('div', { style: { opacity: 0.7 } }, t('loading')))
+        } else {
           // 开关:余额探测
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' } },
+          children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' } },
             h('input', {
               type: 'checkbox',
               checked: values.quotaProbe === true,
               onChange: event => save({ quotaProbe: event.target.checked }),
             }),
-            h('span', null, t('configQuotaProbe'))),
+            h('span', null, t('configQuotaProbe'))))
           // 数字:后台探测轮间隔(分钟);清空/非法时钳回服务端下限 1 分钟(审查 P1-2)。
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-            h('span', null, t('configInterval')),
+          children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            h('span', { style: { flex: 1 } }, t('configInterval')),
             h('input', {
               type: 'number',
               min: 1,
@@ -1225,10 +1248,10 @@ window.__ModuleLoader__.load({
               })),
               onBlur: () => save({ quotaIntervalMs: values.quotaIntervalMs }),
               style: numberStyle,
-            })),
+            })))
           // 数字:组内间隔(毫秒);清空时钳回 200 下限。
-          h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-            h('span', null, t('configGap')),
+          children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            h('span', { style: { flex: 1 } }, t('configGap')),
             h('input', {
               type: 'number',
               min: 200,
@@ -1240,8 +1263,19 @@ window.__ModuleLoader__.load({
               onBlur: () => save({ quotaProbeGapMs: values.quotaProbeGapMs }),
               style: numberStyle,
             }),
-            h('span', { style: { opacity: 0.6 } }, 'ms')),
-          saved ? h('span', { style: { color: '#4caf78' } }, t('configSaved')) : null))
+            h('span', { style: { opacity: 0.6 } }, 'ms')))
+          if (saved) children.push(h('span', { style: { color: '#4caf78' } }, t('configSaved')))
+        }
+      }
+      return h('div', {
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 6,
+          borderTop: '1px solid var(--dsw-alias-border-secondary, #333)',
+          paddingTop: 8,
+        },
+      }, children)
     }
 
     /** 设置页 models footer 的入口提示行。 */
@@ -1301,7 +1335,7 @@ window.__ModuleLoader__.load({
         quotaRemaining: '剩余',
         quotaRefresh: '立即刷新',
         quotaFetchedAt: '探测于',
-        configTitle: '密钥池设置',
+        probeSettings: '后台探测',
         configQuotaProbe: '启用密钥余额探测',
         configInterval: '后台探测间隔(分钟)',
         configGap: '组内探测间隔',
@@ -1362,7 +1396,7 @@ window.__ModuleLoader__.load({
         quotaRemaining: 'remaining',
         quotaRefresh: 'Refresh now',
         quotaFetchedAt: 'Probed at',
-        configTitle: 'Key pool settings',
+        probeSettings: 'Background probing',
         configQuotaProbe: 'Enable key quota probing',
         configInterval: 'Background interval (minutes)',
         configGap: 'In-round gap',
@@ -1482,14 +1516,6 @@ window.__ModuleLoader__.load({
           order: 50,
         }, safe(PoolButton)))
 
-        // 侧边栏底部(设置旁):全场景常驻入口——新会话草稿态没有 Session,
-        // header utilities 不挂载,这里保证任何页面都能打开密钥池。
-        ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-          name: 'sidebar.footer.action',
-          id: 'dsh-key-managment-sidebar',
-          order: 5,
-        }, safe(PoolButton)))
-
         // 设置页供应商卡片:逐命名空间注册"已纳入管理"徽标。
         ctx.slots.inject('settings.models.provider-card', () => {
           const disposers = [
@@ -1505,12 +1531,6 @@ window.__ModuleLoader__.load({
             for (const dispose of disposers) dispose()
           }
         })
-
-        // 插件详情页配置卡:键 = `<包名>#<行 id>`。
-        ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
-          name: 'plugins.row.config',
-          key: 'dsh-key-managment#dsh-key-managment',
-        }, safe(ConfigCard)))
 
         // 设置页 models footer:入口提示。
         ctx.slots.inject('settings.models.footer', () => ctx.slots.register({
