@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "title": "密钥池",
+    "description": "扫描已配置供应商纳入密钥池,手动切换生效密钥"
+  },
+  "buttonLabel": "密钥池",
+  "title": "密钥池",
+  "refresh": "刷新扫描",
+  "currentKey": "当前生效",
+  "unknownKey": "未纳入管理的密钥",
+  "adopt": "纳入池",
+  "addKey": "添加密钥",
+  "keyPlaceholder": "粘贴 API 密钥",
+  "aliasPlaceholder": "名称(默认 Key_n)",
+  "activate": "使用",
+  "rename": "改名",
+  "delete": "删除",
+  "removeProvider": "取消纳管",
+  "empty": "还没有纳管的供应商,点击刷新扫描",
+  "noValue": "未保存密钥值",
+  "active": "生效中",
+  "error": "操作失败",
+  "settingsHint": "点击会话右上角的钥匙按钮管理密钥池",
+  "poolSummary": "已纳管 {count} 个供应商,共 {keys} 把密钥"
+}

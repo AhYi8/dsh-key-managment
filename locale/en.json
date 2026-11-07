@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "title": "Key pool",
+    "description": "Scan configured providers into a key pool and switch the active key manually"
+  },
+  "buttonLabel": "Key pool",
+  "title": "Key pool",
+  "refresh": "Refresh scan",
+  "currentKey": "Active key",
+  "unknownKey": "Unmanaged key",
+  "adopt": "Add to pool",
+  "addKey": "Add key",
+  "keyPlaceholder": "Paste an API key",
+  "aliasPlaceholder": "Name (default Key_n)",
+  "activate": "Use",
+  "rename": "Rename",
+  "delete": "Delete",
+  "removeProvider": "Unmanage provider",
+  "empty": "No managed providers yet; refresh to scan",
+  "noValue": "No key saved",
+  "active": "Active",
+  "error": "Operation failed",
+  "settingsHint": "Use the key button at the top-right of a conversation to manage the key pool",
+  "poolSummary": "{count} provider(s) with {keys} pooled key(s)"
+}
