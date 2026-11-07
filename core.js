@@ -33,6 +33,33 @@ export function newPoolRef(provider) {
   return `KEYMGR_${stem}_${hash}_K_${randomBytes(6).toString('hex').toUpperCase()}`
 }
 
+/**
+ * 从凭据 resolve 的返回值里提取明文。
+ *
+ * 宿主实现返回 `{ value, source }`;这里同时兼容裸字符串与 `{ secret }` 形态,
+ * 让"读凭据"只有一处实现——探测桥与 Host 半区对同一形状的理解必须一致,
+ * 否则会出现"设置页能看到密钥、探测却报密钥不可读"的分裂。
+ */
+export function hitValue(hit) {
+  if (hit === undefined || hit === null) return undefined
+  if (typeof hit === 'string') return hit
+  if (typeof hit.value === 'string' && hit.value.length > 0) return hit.value
+  if (typeof hit.secret === 'string' && hit.secret.length > 0) return hit.secret
+  return undefined
+}
+
+/**
+ * 从一段文本里抹掉密钥明文。
+ *
+ * 余额适配器抛出的错误原文可能带上密钥;错误消息会进 HTTP 响应与落盘快照,
+ * 因此落盘/下发前必须先脱敏(明文只允许存在于凭据存储)。
+ */
+export function redactSecret(message, secret) {
+  const text = typeof message === 'string' ? message : String(message ?? '')
+  if (typeof secret !== 'string' || secret.length === 0) return text
+  return text.split(secret).join('***')
+}
+
 /** 密钥值的 SHA-256 摘要,用于在不见明文的前提下比对"当前生效的是哪一把"。 */
 export function digestOf(value) {
   return createHash('sha256').update(String(value)).digest('hex')
@@ -139,6 +166,73 @@ export function normalizeState(raw) {
     }
   }
   return state
+}
+
+/**
+ * 把内存里的运行时请求计数合并进"刚读自磁盘"的状态(原位修改)。
+ *
+ * requestCount 是本进程累计的调用数,磁盘上只是上次落盘时的快照:
+ * 定时同步(每 60 秒)与变更动作前的同步都会用磁盘状态覆盖内存状态,
+ * 若整体采用磁盘值,计数会被反复清零,"按调用次数轮换"永远攒不满阈值。
+ * 轮换**配置**仍然以磁盘为准(陈旧实例自愈),这里只保留计数。
+ *
+ * @param memoryProviders 同步前的内存状态
+ * @param freshProviders 刚从磁盘读出并规范化的状态(会被原位修改)
+ * @returns freshProviders(便于链式调用)
+ */
+export function mergeRequestCounts(memoryProviders, freshProviders) {
+  if (memoryProviders === null || typeof memoryProviders !== 'object') return freshProviders
+  if (freshProviders === null || typeof freshProviders !== 'object') return freshProviders
+  for (const [provider, record] of Object.entries(memoryProviders)) {
+    const incoming = freshProviders[provider]
+    if (incoming === null || typeof incoming !== 'object') continue
+    const memory = Number(record?.requestCount ?? 0)
+    const disk = Number(incoming.requestCount ?? 0)
+    if (Number.isFinite(memory) && memory > disk) incoming.requestCount = memory
+  }
+  return freshProviders
+}
+
+/**
+ * 探测配置的取值约束;与 Host 半区 Config schema 保持一致。
+ *
+ * 规则放在纯函数里:界面与宿主按同一份约束校验,免得用户填了值却被拒。
+ */
+export const PROBE_CONFIG_RULES = {
+  quotaProbe: { type: 'boolean' },
+  quotaIntervalMs: { min: 60_000, max: 86_400_000, step: 60_000, stepHint: '(整分钟)' },
+  quotaProbeGapMs: { min: 200, max: 60_000, step: 100 },
+}
+
+/** 校验一个数字型配置字段;返回错误消息(null 表示通过)。 */
+function checkNumberRule(name, value, rule) {
+  if (value === undefined) return null
+  // 类型错误与越界共用一条消息:同一个字段的说法保持一致。
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < rule.min || value > rule.max) {
+    return `${name} 必须是 ${rule.min}-${rule.max} 之间的数字`
+  }
+  // 步长:schema 用 step 约束,不合规的值宿主会抛英文原文错误,这里先给出中文提示。
+  if (value % rule.step !== 0) {
+    return `${name} 必须是 ${rule.step} 的倍数${rule.stepHint ?? ''}`
+  }
+  return null
+}
+
+/**
+ * 校验探测配置补丁;返回错误消息(null 表示通过)。
+ *
+ * @param patch 待校验的补丁,如 { quotaIntervalMs: 90000 }
+ */
+export function validateProbeConfig(patch) {
+  if (patch === null || typeof patch !== 'object') return '配置补丁必须是对象'
+  if (patch.quotaProbe !== undefined && typeof patch.quotaProbe !== 'boolean') {
+    return 'quotaProbe 必须是布尔值'
+  }
+  const intervalError = checkNumberRule('quotaIntervalMs', patch.quotaIntervalMs, PROBE_CONFIG_RULES.quotaIntervalMs)
+  if (intervalError !== null) return intervalError
+  const gapError = checkNumberRule('quotaProbeGapMs', patch.quotaProbeGapMs, PROBE_CONFIG_RULES.quotaProbeGapMs)
+  if (gapError !== null) return gapError
+  return null
 }
 
 /**
@@ -251,6 +345,10 @@ export function healthFromQuota(payload, prev, prevLevel, now) {
 
 /**
  * 轮换候选判定:无效密钥跳过;限流密钥在冷却期内跳过(到期自动恢复参选)。
+ *
+ * 注意 valueMissing 只存在于**视图投影**(projectProvider 产出),
+ * 池内原始记录没有这个字段——轮换路径上"值已被外部删除"的密钥由
+ * activate 失败兜底(标记为 invalid 后继续找下一把)。
  */
 export function isSelectable(key, now) {
   if (key.valueMissing === true) return false

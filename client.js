@@ -156,10 +156,11 @@ window.__ModuleLoader__.load({
       if (payload?.status !== 'ok' || !Array.isArray(payload.windows) || payload.windows.length === 0) {
         return undefined
       }
-      const window = payload.windows[0]
-      if (typeof window.usedPercent === 'number') return Math.min(100, Math.max(0, window.usedPercent))
-      if (typeof window.remainingPercent === 'number') {
-        return Math.min(100, Math.max(0, 100 - window.remainingPercent))
+      // 局部变量不要叫 window:会遮蔽全局 window 对象,后续改动极易踩坑。
+      const win = payload.windows[0]
+      if (typeof win.usedPercent === 'number') return Math.min(100, Math.max(0, win.usedPercent))
+      if (typeof win.remainingPercent === 'number') {
+        return Math.min(100, Math.max(0, 100 - win.remainingPercent))
       }
       return undefined
     }
@@ -282,18 +283,18 @@ window.__ModuleLoader__.load({
           payload === undefined
             ? h('div', { style: { opacity: 0.7 } }, props.t('quotaLoading'))
             : payload.status === 'ok'
-              ? (payload.windows ?? []).map((window, index) => {
-                const used = typeof window.usedPercent === 'number'
-                  ? window.usedPercent
-                  : typeof window.remainingPercent === 'number' ? window.remainingPercent : undefined
+              ? (payload.windows ?? []).map((win, index) => {
+                const used = typeof win.usedPercent === 'number'
+                  ? win.usedPercent
+                  : typeof win.remainingPercent === 'number' ? win.remainingPercent : undefined
                 // 与环一致:展示剩余;usedPercent 是已用,取反。
                 const remaining = used === undefined
                   ? undefined
-                  : typeof window.usedPercent === 'number' ? 100 - used : used
+                  : typeof win.usedPercent === 'number' ? 100 - used : used
                 const barColor = remainingColor(remaining)
-                return h('div', { key: window.tier ?? index, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                return h('div', { key: win.tier ?? index, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
                   h('div', { style: { display: 'flex', justifyContent: 'space-between' } },
-                    h('span', null, `${tierLabel(window.tier)} ${props.t('quotaRemaining')}`),
+                    h('span', null, `${tierLabel(win.tier)} ${props.t('quotaRemaining')}`),
                     h('strong', null, remaining === undefined ? '-' : `${Math.round(remaining)}%`)),
                   h('div', {
                     style: {
@@ -308,7 +309,7 @@ window.__ModuleLoader__.load({
                       background: barColor,
                     },
                   })),
-                  h('div', { style: { opacity: 0.6 } }, `${formatReset(window.resetAt)} ${t('resetSuffix')}`))
+                  h('div', { style: { opacity: 0.6 } }, `${formatReset(win.resetAt)} ${t('resetSuffix')}`))
               })
               : h('div', { style: { opacity: 0.75 } },
                 payload.status === 'unsupported'
@@ -545,14 +546,28 @@ window.__ModuleLoader__.load({
       /** 正在刷新的密钥 id。 */
       const [refreshingKey, setRefreshingKey] = useState(null)
       const mounted = useRef(true)
-      useEffect(() => () => { mounted.current = false }, [])
+      // 卸载守卫:挂载时复位为 true,卸载时置 false。
+      // 只在 cleanup 里置 false 是不够的——React 18 StrictMode 会"挂载→卸载→再挂载",
+      // 第二次挂载后 mounted.current 会一直停在 false,面板从此不再更新。
+      useEffect(() => {
+        mounted.current = true
+        return () => { mounted.current = false }
+      }, [])
 
       const run = useCallback(async (fn) => {
         setBusy(true)
         setError('')
         try {
           const next = await fn()
-          if (mounted.current) setState(next)
+          // 视图字段兜底:响应缺 providers/available/quotas 时补空集合,
+          // 避免渲染直接抛错把整块面板打白(不变量:响应必须含完整视图字段)。
+          const normalized = {
+            ...next,
+            providers: Array.isArray(next?.providers) ? next.providers : [],
+            available: Array.isArray(next?.available) ? next.available : [],
+            quotas: next?.quotas ?? {},
+          }
+          if (mounted.current) setState(normalized)
           return true
         } catch (cause) {
           // 返回成功布尔:调用方的 .then 只有在真正成功时才做清空/关编辑器,
@@ -593,8 +608,10 @@ window.__ModuleLoader__.load({
         if (state.quotas === undefined || state.quotas === null) return
         const map = {}
         for (const [cacheKey, payload] of Object.entries(state.quotas)) {
-          const keyId = cacheKey.split('/')[1]
-          if (keyId !== undefined) map[keyId] = payload
+          // 服务端下发的是 `供应商/密钥 id`:按最后一个 '/' 切分,
+          // 供应商名里若含 '/' 也不会取错段。
+          const keyId = cacheKey.slice(cacheKey.lastIndexOf('/') + 1)
+          if (keyId !== undefined && keyId.length > 0) map[keyId] = payload
         }
         setQuotas(map)
       }, [state]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -606,9 +623,14 @@ window.__ModuleLoader__.load({
           .then((next) => {
             if (mounted.current && next.ok) {
               setQuotas(prev => ({ ...prev, [keyId]: next.payload }))
+              setError('')
             }
           })
-          .catch(() => { /* 保持旧值 */ })
+          .catch((cause) => {
+            // 失败必须让用户看见:否则圆环停在旧值上,
+            // 看起来像"余额没变",实际是探测请求挂了。
+            if (mounted.current) setError(cause?.message ?? String(cause))
+          })
           .finally(() => { if (mounted.current) setRefreshingKey(null) })
       }
 
@@ -1151,8 +1173,20 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('')
       const [saved, setSaved] = useState(false)
       const mounted = useRef(true)
-      // 卸载守卫:异步回包晚于卸载时不再 setState(审查 P2-7)。
-      useEffect(() => () => { mounted.current = false }, [])
+      // 已落盘确认过的值:与它相同的补丁不再下发——
+      // 每次 setConfig 都会写 profile patch 并触发 Loader 复核,徒增重载。
+      const confirmed = useRef(null)
+      // 是否有保存请求在途:在途时不按"值没变"跳过,
+      // 否则连点两次开关时第二次会被误判成重复提交而丢掉。
+      const saving = useRef(false)
+      // 保存请求的序号:回包乱序时只认最后一次请求的结果,
+      // 避免旧回包把新值覆盖回去。
+      const seq = useRef(0)
+      // 卸载守卫:挂载时复位为 true,卸载时置 false(StrictMode 下会重新挂载)。
+      useEffect(() => {
+        mounted.current = true
+        return () => { mounted.current = false }
+      }, [])
       // 展开时才拉配置:打开悬浮框本身不额外发请求。
       useEffect(() => {
         if (!open) return undefined
@@ -1160,6 +1194,11 @@ window.__ModuleLoader__.load({
         api('getConfig')
           .then(next => {
             if (cancelled) return
+            confirmed.current = {
+              quotaProbe: next.quotaProbe === true,
+              quotaIntervalMs: next.quotaIntervalMs,
+              quotaProbeGapMs: next.quotaProbeGapMs,
+            }
             setValues({
               quotaProbe: next.quotaProbe,
               quotaIntervalMs: next.quotaIntervalMs,
@@ -1170,11 +1209,25 @@ window.__ModuleLoader__.load({
         return () => { cancelled = true }
       }, [open])
       const save = async (patch) => {
+        // 值没变就不写盘:避免无意义的 profile patch 写入与插件重载。
+        if (!saving.current && confirmed.current !== null) {
+          const changed = Object.entries(patch).some(([key, value]) => confirmed.current[key] !== value)
+          if (!changed) return
+        }
         setError('')
         setSaved(false)
+        saving.current = true
+        const ticket = ++seq.current
         try {
           const next = await api('setConfig', patch)
           if (!mounted.current) return
+          // 已有更新的请求在途:这次回包作废,避免用旧值覆盖新值。
+          if (ticket !== seq.current) return
+          confirmed.current = {
+            quotaProbe: next.quotaProbe === true,
+            quotaIntervalMs: next.quotaIntervalMs,
+            quotaProbeGapMs: next.quotaProbeGapMs,
+          }
           setValues({
             quotaProbe: next.quotaProbe,
             quotaIntervalMs: next.quotaIntervalMs,
@@ -1182,7 +1235,13 @@ window.__ModuleLoader__.load({
           })
           setSaved(true)
         } catch (cause) {
-          if (mounted.current) setError(cause?.message ?? String(cause))
+          if (mounted.current) {
+            setError(cause?.message ?? String(cause))
+            // 保存失败:回滚到最后一次确认过的值,界面不与服务端状态分叉。
+            if (ticket === seq.current && confirmed.current !== null) setValues({ ...confirmed.current })
+          }
+        } finally {
+          saving.current = false
         }
       }
       const numberStyle = {
@@ -1222,14 +1281,20 @@ window.__ModuleLoader__.load({
           children.push(h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, error))
         }
         if (values === null) {
-          children.push(h('div', { style: { opacity: 0.7 } }, t('loading')))
+          // 拉取失败时不再并排显示"加载中…":两者同时出现会让人以为还在等。
+          if (error === '') children.push(h('div', { style: { opacity: 0.7 } }, t('loading')))
         } else {
-          // 开关:余额探测
+          // 开关:余额探测。先本地翻转再下发,否则受控开关要等回包才动,
+          // 连点两次还会因为中间态被 React 复位而"关不掉"。
           children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' } },
             h('input', {
               type: 'checkbox',
               checked: values.quotaProbe === true,
-              onChange: event => save({ quotaProbe: event.target.checked }),
+              onChange: event => {
+                const checked = event.target.checked
+                setValues(prev => ({ ...prev, quotaProbe: checked }))
+                save({ quotaProbe: checked })
+              },
             }),
             h('span', null, t('configQuotaProbe'))))
           // 数字:后台探测轮间隔(分钟);清空/非法时钳回服务端下限 1 分钟(审查 P1-2)。
@@ -1244,7 +1309,8 @@ window.__ModuleLoader__.load({
               disabled: values.quotaProbe !== true,
               onChange: event => setValues(prev => ({
                 ...prev,
-                quotaIntervalMs: Math.max(60_000, (Number(event.target.value) || 1) * 60_000),
+                // 服务端区间是 1 分钟 ~ 24 小时,这里先钳住,避免把非法值发过去。
+                quotaIntervalMs: Math.min(86_400_000, Math.max(60_000, (Number(event.target.value) || 1) * 60_000)),
               })),
               onBlur: () => save({ quotaIntervalMs: values.quotaIntervalMs }),
               style: numberStyle,
@@ -1259,8 +1325,18 @@ window.__ModuleLoader__.load({
               step: 100,
               value: values.quotaProbeGapMs,
               disabled: values.quotaProbe !== true,
-              onChange: event => setValues(prev => ({ ...prev, quotaProbeGapMs: snapProbeGap(event.target.value) })),
-              onBlur: () => save({ quotaProbeGapMs: values.quotaProbeGapMs }),
+              // 输入过程中不取整、不钳下限:否则键入 "5" 立刻变成 200,
+              // 接着键入 "000" 就成了 2000——想填 5000 根本打不出来。
+              onChange: event => setValues(prev => ({
+                ...prev,
+                quotaProbeGapMs: Math.min(60_000, Math.max(0, Number(event.target.value) || 0)),
+              })),
+              // 失焦时才按 schema 的步长(100ms 的倍数)取整并下发。
+              onBlur: () => {
+                const snapped = snapProbeGap(values.quotaProbeGapMs)
+                setValues(prev => ({ ...prev, quotaProbeGapMs: snapped }))
+                save({ quotaProbeGapMs: snapped })
+              },
               style: numberStyle,
             }),
             h('span', { style: { opacity: 0.6 } }, 'ms')))
@@ -1420,12 +1496,15 @@ window.__ModuleLoader__.load({
       },
     }
 
-    /** 翻译函数;locale 服务不可用时退回字典直查(默认中文)。 */
-    let t = (key, params) => {
+    /** 内置中文兜底:locale 不可用或返回键名时用它,保证文案永远是中文。 */
+    function fallbackText(key, params) {
       const template = DICTS.zh[key] ?? key
       if (params === undefined) return template
       return template.replace(/\{(\w+)\}/g, (match, name) => (params[name] === undefined ? match : String(params[name])))
     }
+
+    /** 翻译函数;locale 服务不可用时退回字典直查(默认中文)。 */
+    let t = (key, params) => fallbackText(key, params)
 
     /**
      * slot 错误边界:内部组件崩溃时只吞掉自己并留日志,
@@ -1495,13 +1574,17 @@ window.__ModuleLoader__.load({
         try {
           const translate = ctx.locale.bind('dsh-key-managment')
           t = (key, params) => {
-            const served = translate(key, params)
+            let served
+            try {
+              served = translate(key, params)
+            } catch {
+              // locale 服务自身抛错(缺键/未初始化)也不能让整个面板崩。
+              return fallbackText(key, params)
+            }
             // locale 服务可能缓存了旧版字典:对新增键它会原样返回键名。
             // 结果为空或等于键名时,回退到内置中文,保证永远是中文文案。
             if (served === undefined || served === null || served === key) {
-              const template = DICTS.zh[key] ?? key
-              if (params === undefined) return template
-              return template.replace(/\{(\w+)\}/g, (match, name) => (params[name] === undefined ? match : String(params[name])))
+              return fallbackText(key, params)
             }
             return served
           }

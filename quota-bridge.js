@@ -9,6 +9,7 @@
 import { resolveQuotaAdapter } from './quota/registry.js'
 import { withCatalogBaseUrl } from './quota/credentials.js'
 import { QuotaQueryError } from './quota/types.js'
+import { hitValue, redactSecret } from './core.js'
 
 /** ok 结果缓存时长:仅防御手速极快的连续刷新,后台节奏由配置驱动。 */
 const CACHE_TTL_MS = 60_000
@@ -17,7 +18,7 @@ const QUERY_TIMEOUT_MS = 10_000
 
 /** 探测结果负载的公共壳。 */
 function payloadOf(status, extra = {}) {
-  return { status: extra.status ?? status, fetchedAt: Date.now(), ...extra }
+  return { status, fetchedAt: Date.now(), ...extra }
 }
 
 /**
@@ -42,11 +43,11 @@ export async function probeKey(ctx, record, key, profile, cache, inflight, force
   const running = inflight.get(cacheKey)
   if (running !== undefined) return running
   const query = (async () => {
+    // apiKey 必须在 try 外声明:catch 里要用它做脱敏,
+    // 若只在 try 内用 const 声明,catch 作用域拿不到它,脱敏会静默失效。
+    let apiKey
     try {
-      const value = await ctx.credentials.resolve(key.ref)
-      const apiKey = typeof value === 'string'
-        ? value
-        : typeof value?.value === 'string' && value.value.length > 0 ? value.value : undefined
+      apiKey = hitValue(await ctx.credentials.resolve(key.ref))
       if (apiKey === undefined) {
         return payloadOf('error', { provider: record.provider, keyId: key.id, error: { kind: 'no-credential', message: '密钥值不可读' } })
       }
@@ -76,9 +77,7 @@ export async function probeKey(ctx, record, key, profile, cache, inflight, force
     } catch (error) {
       // 错误消息会进 HTTP 响应与落盘快照:脱掉密钥片段并截断,
       // 不让第三方适配器的原文成为泄露通道(审查 P2-4)。
-      let message = error?.message ?? String(error)
-      if (typeof apiKey === 'string' && apiKey.length > 0) message = message.split(apiKey).join('***')
-      message = message.slice(0, 300)
+      const message = redactSecret(error?.message ?? String(error), apiKey).slice(0, 300)
       return payloadOf('error', {
         provider: record.provider,
         keyId: key.id,

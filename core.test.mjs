@@ -4,15 +4,19 @@ import assert from 'node:assert/strict'
 import {
   digestOf,
   findKeyByDigest,
+  hitValue,
+  mergeRequestCounts,
   newProviderRecord,
   nextAlias,
   normalizeState,
   parseAction,
   probeRoundDelay,
   projectProvider,
+  redactSecret,
   tailOf,
   validateAlias,
   validateKeyValue,
+  validateProbeConfig,
 } from './core.js'
 
 test('validateKeyValue 拒绝空值与超长值', () => {
@@ -216,6 +220,28 @@ test('probeRoundDelay:首轮立即,之后按间隔且不低于 1 分钟', () => 
   assert.equal(probeRoundDelay(1, Number.POSITIVE_INFINITY), 60_000)
 })
 
+test('validateProbeConfig 按区间与步长校验探测配置', () => {
+  // 合法值通过。
+  assert.equal(validateProbeConfig({}), null)
+  assert.equal(validateProbeConfig({ quotaProbe: true }), null)
+  assert.equal(validateProbeConfig({ quotaIntervalMs: 60_000 }), null)
+  assert.equal(validateProbeConfig({ quotaIntervalMs: 1_800_000 }), null)
+  assert.equal(validateProbeConfig({ quotaProbeGapMs: 5_000 }), null)
+  // 类型错误。
+  assert.equal(validateProbeConfig({ quotaProbe: 'yes' }), 'quotaProbe 必须是布尔值')
+  assert.notEqual(validateProbeConfig({ quotaIntervalMs: '60000' }), null)
+  // 越界。
+  assert.equal(validateProbeConfig({ quotaIntervalMs: 59_999 }), 'quotaIntervalMs 必须是 60000-86400000 之间的数字')
+  assert.equal(validateProbeConfig({ quotaIntervalMs: 86_400_001 }), 'quotaIntervalMs 必须是 60000-86400000 之间的数字')
+  assert.equal(validateProbeConfig({ quotaProbeGapMs: 199 }), 'quotaProbeGapMs 必须是 200-60000 之间的数字')
+  assert.equal(validateProbeConfig({ quotaProbeGapMs: 60_001 }), 'quotaProbeGapMs 必须是 200-60000 之间的数字')
+  // 步长:不合规时宿主会抛英文原文错误,这里先给中文提示。
+  assert.equal(validateProbeConfig({ quotaIntervalMs: 90_000 }), 'quotaIntervalMs 必须是 60000 的倍数(整分钟)')
+  assert.equal(validateProbeConfig({ quotaProbeGapMs: 250 }), 'quotaProbeGapMs 必须是 100 的倍数')
+  // 补丁本身必须是对象。
+  assert.notEqual(validateProbeConfig(null), null)
+})
+
 test('parseAction 校验请求体', () => {
   assert.notEqual(parseAction(null).error, undefined)
   assert.notEqual(parseAction({}).error, undefined)
@@ -223,4 +249,48 @@ test('parseAction 校验请求体', () => {
   assert.equal(ok.action, 'activateKey')
   assert.equal(ok.provider, 'temp')
   assert.equal(ok.keyId, 'k1')
+})
+
+test('hitValue 兼容宿主凭据的返回形状', () => {
+  // 宿主实现返回 { value, source }。
+  assert.equal(hitValue({ value: 'sk-1', source: 'file' }), 'sk-1')
+  assert.equal(hitValue('sk-2'), 'sk-2')
+  assert.equal(hitValue({ secret: 'sk-3' }), 'sk-3')
+  // 空串与缺失都按"没有值"处理。
+  assert.equal(hitValue({ value: '' }), undefined)
+  assert.equal(hitValue(undefined), undefined)
+  assert.equal(hitValue(null), undefined)
+})
+
+test('redactSecret 把错误消息里的密钥明文抹掉', () => {
+  assert.equal(redactSecret('key sk-abc is invalid', 'sk-abc'), 'key *** is invalid')
+  assert.equal(redactSecret('sk-abc sk-abc', 'sk-abc'), '*** ***')
+  // 没有密钥或消息为空时不改变内容。
+  assert.equal(redactSecret('no secret here', ''), 'no secret here')
+  assert.equal(redactSecret(undefined, 'sk-abc'), '')
+})
+
+test('mergeRequestCounts 保留内存计数,轮换配置仍以磁盘为准', () => {
+  const memory = { p1: { requestCount: 12 }, p2: { requestCount: 3 } }
+  const fresh = normalizeState({
+    providers: {
+      p1: { keyRef: 'P1_KEY', requestCount: 0, rotation: { mode: 'calls', requests: 50 } },
+      p2: { keyRef: 'P2_KEY', requestCount: 9 },
+    },
+  })
+  const merged = mergeRequestCounts(memory, fresh.providers)
+  // 内存计数更大:保留内存值(否则定时同步会把计数清零,按次数轮换永远触发不了)。
+  assert.equal(merged.p1.requestCount, 12)
+  // 磁盘计数更大:以磁盘为准。
+  assert.equal(merged.p2.requestCount, 9)
+  // 轮换配置只认磁盘。
+  assert.equal(merged.p1.rotation.mode, 'calls')
+  assert.equal(merged.p1.rotation.requests, 50)
+})
+
+test('isSelectable 跳过值已缺失的密钥', async () => {
+  const { isSelectable } = await import('./core.js')
+  const now = 1_000_000
+  assert.equal(isSelectable({ health: 'ok', valueMissing: true }, now), false)
+  assert.equal(isSelectable({ health: 'ok', valueMissing: false }, now), true)
 })

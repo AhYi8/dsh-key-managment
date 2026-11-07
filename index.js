@@ -19,10 +19,12 @@ import z from '@deepseek-ai/schemastery'
 import { probeKey } from './quota-bridge.js'
 import {
   healthFromQuota,
+  hitValue,
   isSelectable,
   MAX_KEYS_PER_PROVIDER,
   digestOf,
   findKeyByDigest,
+  mergeRequestCounts,
   newKeyId,
   newPoolRef,
   newProviderRecord,
@@ -39,6 +41,7 @@ import {
   tailOf,
   validateAlias,
   validateKeyValue,
+  validateProbeConfig,
 } from './core.js'
 
 export const name = 'dsh-key-managment'
@@ -76,20 +79,32 @@ function getPath(value, path) {
   return current
 }
 
-/** 从凭据 resolve 的返回值里提取明文;返回形状做防御性兼容。 */
-function hitValue(hit) {
-  if (hit === undefined || hit === null) return undefined
-  if (typeof hit === 'string') return hit
-  if (typeof hit.value === 'string' && hit.value.length > 0) return hit.value
-  if (typeof hit.secret === 'string' && hit.secret.length > 0) return hit.secret
-  return undefined
-}
-
 /** 读取一个 volatile 配置字段的当前值(取值器或字面量)。 */
 function live(config, field, fallback) {
   const value = config?.[field]
   if (value !== null && typeof value === 'object' && typeof value.get === 'function') return value.get()
   return value === undefined ? fallback : value
+}
+
+/**
+ * 原子改名的有界重试。
+ *
+ * Windows 上文件被占用(杀毒软件/索引服务/其它实例)时 rename 会以
+ * EACCES/EPERM/EBUSY 失败;重试几次通常就能成功,否则每次失败都会在
+ * profile 目录里留下一个临时文件。
+ */
+async function renameWithRetry(from, to, attempts = 5) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rename(from, to)
+      return
+    } catch (error) {
+      const code = error?.code
+      const transient = code === 'EACCES' || code === 'EPERM' || code === 'EBUSY'
+      if (!transient || attempt >= attempts) throw error
+      await new Promise(resolve => setTimeout(resolve, 50 * attempt))
+    }
+  }
 }
 
 export function apply(ctx, config) {
@@ -139,7 +154,22 @@ export function apply(ctx, config) {
    * 会打到目录默认端点、得到与实际账户无关的余额。
    */
   let releaseStartup
-  const startupReady = new Promise(resolve => { releaseStartup = resolve })
+  let startupTimer
+  const startupReady = new Promise(resolve => {
+    releaseStartup = () => {
+      if (startupTimer !== undefined) {
+        clearTimeout(startupTimer)
+        startupTimer = undefined
+      }
+      resolve()
+    }
+  })
+  // 兜底:settings 迟到或扫描卡死时,超时后照样开跑。
+  // 否则后台探测会静默停摆——宁可用目录默认端点探一轮,也不要完全不探。
+  startupTimer = setTimeout(() => {
+    ctx.warn?.('后台探测启动闸门超时:未等到 settings 就绪,先按目录默认端点探一轮')
+    releaseStartup()
+  }, 30_000)
 
   /** 首次扫描标记;失败可由下一次 API 调用重试。 */
   let scanned = false
@@ -174,7 +204,13 @@ export function apply(ctx, config) {
   }), 'dsh-key-managment: configEditor 获取')
 
   // 卸载标记:插件被移除/重载时置位,让在飞的后台轮主动放弃本轮。
-  ctx.effect(() => () => { disposed = true }, 'dsh-key-managment: 卸载标记')
+  ctx.effect(() => () => {
+    disposed = true
+    if (startupTimer !== undefined) {
+      clearTimeout(startupTimer)
+      startupTimer = undefined
+    }
+  }, 'dsh-key-managment: 卸载标记')
 
   async function readStateFile(path) {
     try {
@@ -186,18 +222,27 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 落盘临时文件后缀:每个实例一个。
+   *
+   * 插件重载时新旧实例可能同时落盘,共用固定临时名会互相截断、写出半截 JSON;
+   * 同一实例内的落盘已串行化(persistTail / quotaTail),复用同一个临时名不会
+   * 并发写,失败残留的临时文件也最多一个,不会无界堆积。
+   */
+  const tempSuffix = randomUUID()
+
+  /**
    * 原子化写状态文件:先写临时文件再改名。
    * persistTail 串行化所有落盘:定时轮、stream 归因、API 变更都可能并发
    * 触发 persist,交错写同一个临时文件会落成半截 JSON(审查 P0-1)。
    */
   let persistTail = Promise.resolve()
   function persist() {
-    persistTail = persistTail.then(async () => {
-      // 临时文件逐次唯一:插件重载时新旧实例可能同时落盘,
-      // 共用同一个临时文件会互相截断,写出半截 JSON 把状态写坏。
-      const tempPath = `${statePath}.${randomUUID()}.tmp`
+    // 链首先吃掉上一次失败:否则一次写盘错误(磁盘满/权限)会让 persistTail
+    // 永远处于 rejected 状态,之后所有落盘都被跳过,插件变更静默丢失。
+    persistTail = persistTail.catch(() => {}).then(async () => {
+      const tempPath = `${statePath}.${tempSuffix}.tmp`
       await writeFile(tempPath, JSON.stringify(state, null, 2), 'utf8')
-      await rename(tempPath, statePath)
+      await renameWithRetry(tempPath, statePath)
     })
     return persistTail
   }
@@ -247,16 +292,22 @@ export function apply(ctx, config) {
     return profile !== null && typeof profile === 'object' ? profile : undefined
   }
 
-  /** 余额快照落盘:原子写,失败只留日志(快照可重建,不值得打断请求)。 */
+  /** 余额快照落盘:原子写 + 串行化,失败只留日志(快照可重建,不值得打断请求)。 */
+  let quotaTail = Promise.resolve()
   async function persistQuota() {
-    try {
-      // 与状态文件同理:临时名逐次唯一,避免并发写互相截断。
-      const tempPath = `${quotaPath}.${randomUUID()}.tmp`
-      await writeFile(tempPath, JSON.stringify(Object.fromEntries(quotaStore), null, 2), 'utf8')
-      await rename(tempPath, quotaPath)
-    } catch (error) {
-      ctx.warn?.(`余额快照落盘失败: ${error?.message ?? error}`)
-    }
+    // 单独一条串行队列:后台轮、删密钥、手动刷新可能同时触发落盘,
+    // 并发写会让"已删除的条目"被后到的旧快照写回文件。
+    quotaTail = quotaTail.catch(() => {}).then(async () => {
+      try {
+        // 与状态文件同理:临时名按实例唯一,避免并发写互相截断。
+        const tempPath = `${quotaPath}.${tempSuffix}.tmp`
+        await writeFile(tempPath, JSON.stringify(Object.fromEntries(quotaStore), null, 2), 'utf8')
+        await renameWithRetry(tempPath, quotaPath)
+      } catch (error) {
+        ctx.warn?.(`余额快照落盘失败: ${error?.message ?? error}`)
+      }
+    })
+    return quotaTail
   }
 
   /** 一个供应商的余额快照(不探测);界面打开弹窗只读这个,不再全量探测。 */
@@ -291,6 +342,9 @@ export function apply(ctx, config) {
         if (record === undefined) continue
         const profile = profileOf(record.provider)
         for (const key of record.keys) {
+          // 卸载后立即放弃本轮:组内间隔动辄数秒,只在 provider 边界检查不够——
+          // 继续探测并落盘会把旧实例的状态覆盖到新实例已经写好的文件上。
+          if (disposed) return
           if (!first) await new Promise(resolve => setTimeout(resolve, gapMs))
           first = false
           // force=true:后台轮的目标就是刷新,不被 TTL 短路。
@@ -305,6 +359,8 @@ export function apply(ctx, config) {
           }
         }
       }
+      // 落盘前再确认一次:卸载后不再用旧内存态覆盖新实例已写入的文件。
+      if (disposed) return
       await persistQuota()
       if (stateDirty) await persist()
     } catch (error) {
@@ -391,7 +447,16 @@ export function apply(ctx, config) {
     record.lastRotatedAt = Date.now()
     state.providers[provider] = record
     found.managed = true
-    await persist()
+    try {
+      await persist()
+    } catch (error) {
+      // 落盘失败:凭据已写进凭据库而状态文件没有它,
+      // 会留下一把无人管理的明文密钥(界面也删不掉),必须补偿清理。
+      try { await ctx.credentials.unset(ref) } catch { /* 尽力清理 */ }
+      delete state.providers[provider]
+      found.managed = false
+      throw error
+    }
     return view(provider)
   }
 
@@ -423,8 +488,8 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < total; attempt += 1) {
       const nextId = pickNextKeyId(record, Date.now(), record.activeKeyId ?? undefined)
       if (nextId === undefined) break
-      const key = record.keys.find(item => item.id === nextId)
       const index = record.keys.findIndex(item => item.id === nextId)
+      const key = record.keys[index]
       // 未知候选:先探测一次,探测即落定健康状态(结果同时进余额快照)。
       if ((key.health ?? 'unknown') === 'unknown') {
         const payload = await probeKey(ctx, record, key, profileOf(provider), quotaStore, quotaInflight, true)
@@ -503,7 +568,6 @@ export function apply(ctx, config) {
     return null
   }
 
-  /** 添加密钥:默认命名 Key_n,值重复时拒绝。 */
   /** 落盘失败时补偿清理本次已写入的凭据引用,避免游离明文(审查 P2-3)。 */
   async function persistWithCompensation(record, createdRefs) {
     try {
@@ -518,6 +582,7 @@ export function apply(ctx, config) {
     }
   }
 
+  /** 添加密钥:默认命名 Key_n,值重复时拒绝。 */
   async function addKey(provider, value, alias) {
     const record = requireRecord(provider)
     const createdRefs = []
@@ -609,9 +674,9 @@ export function apply(ctx, config) {
     delete state.providers[provider]
     await persist()
     await persistQuota()
+    // 目录标记只在内存里(不落盘),改完不必再写一次状态文件。
     const found = directory.get(provider)
     if (found !== undefined) found.managed = false
-    await persist()
     return view()
   }
 
@@ -655,6 +720,15 @@ export function apply(ctx, config) {
     }
     if (force) quotaStore.delete(`${provider}\u0000${keyId}`)
     const payload = await probeKey(ctx, record, key, profileOf(provider), quotaStore, quotaInflight, force === true)
+    // 手动探测也要落定健康状态:否则徽标(来自状态文件)与圆环(来自本次探测)
+    // 会各说各话——圆环已经报"密钥无效",徽标还挂着"有效"。
+    const verdict = healthFromQuota(payload, key.health ?? 'unknown', key.cooldownLevel ?? 0, Date.now())
+    if (key.health !== verdict.health || (key.cooldownUntil ?? 0) !== verdict.cooldownUntil) {
+      key.health = verdict.health
+      key.cooldownUntil = verdict.cooldownUntil
+      key.cooldownLevel = verdict.level
+      await persist()
+    }
     await persistQuota()
     return { ok: true, payload }
   }
@@ -671,27 +745,10 @@ export function apply(ctx, config) {
 
   /** 写插件配置:经 configEditor 走 Loader 正常落盘;volatile 字段即时生效。 */
   async function writeConfig(patch) {
-    if (patch.quotaProbe !== undefined && typeof patch.quotaProbe !== 'boolean') {
-      throw new Error('quotaProbe 必须是布尔值')
-    }
-    if (patch.quotaIntervalMs !== undefined
-      && (typeof patch.quotaIntervalMs !== 'number' || patch.quotaIntervalMs < 60_000 || patch.quotaIntervalMs > 86_400_000)) {
-      throw new Error('quotaIntervalMs 必须是 60000-86400000 之间的数字')
-    }
-    if (patch.quotaProbeGapMs !== undefined
-      && (typeof patch.quotaProbeGapMs !== 'number' || patch.quotaProbeGapMs < 200 || patch.quotaProbeGapMs > 60_000)) {
-      throw new Error('quotaProbeGapMs 必须是 200-60000 之间的数字')
-    }
-    // schema 对这两个字段有步长约束(轮间隔按整分钟、组内间隔按 100ms):
-    // 不满足时宿主会抛英文原文错误,这里先给出中文提示。
-    if (patch.quotaIntervalMs !== undefined && typeof patch.quotaIntervalMs === 'number'
-      && patch.quotaIntervalMs % 60_000 !== 0) {
-      throw new Error('quotaIntervalMs 必须是 60000 的倍数(整分钟)')
-    }
-    if (patch.quotaProbeGapMs !== undefined && typeof patch.quotaProbeGapMs === 'number'
-      && patch.quotaProbeGapMs % 100 !== 0) {
-      throw new Error('quotaProbeGapMs 必须是 100 的倍数')
-    }
+    // 校验规则放在 core 的纯函数里,与单测共用同一份:
+    // 界面按一套规则、宿主按另一套,是最常见的手写校验错位来源。
+    const configError = validateProbeConfig(patch)
+    if (configError !== null) throw new Error(configError)
     const entry = ctx.fiber?.entry
     if (entry === undefined || configEditor === undefined) {
       throw new Error('当前环境不支持配置写入')
@@ -713,15 +770,21 @@ export function apply(ctx, config) {
     'rotateNow',
     'setRotation',
     'refresh',
+    // quotaKey 会把探测结论写回健康状态,同样要先以磁盘为准。
+    'quotaKey',
   ])
 
   /**
    * 以磁盘为准原位同步 providers:陈旧实例(重载残留)的内存配置可能与
    * 磁盘不一致,导致"界面已关闭轮换却仍在轮换"(审查后用户实测命中)。
+   *
+   * 轮换配置(模式/间隔/次数)一律以磁盘为准;但 requestCount 是本进程
+   * 累计的调用数,磁盘上只是上次落盘时的快照——这里保留内存里的较大值,
+   * 否则每 60 秒一次的定时同步会把计数清零,"按调用次数轮换"永远触发不了。
    */
   async function syncProvidersFromDisk() {
     const fresh = normalizeState(await readStateFile(statePath))
-    state.providers = fresh.providers
+    state.providers = mergeRequestCounts(state.providers, fresh.providers)
   }
 
   /** 动作分派;所有变更动作串行执行。 */
@@ -798,7 +861,8 @@ export function apply(ctx, config) {
     }
   }
 
-  // 启动扫描已在 ready 里完成(读盘 + scan);这里不再重复扫描。
+  // 首次扫描不在 ready 里做:settings 注入可能晚于启动,
+  // 扫描统一由 settings 就绪后的补扫与 API 调用前的 ensureScanned 触发。
 
   // 请求归因:llm/stream 瀑布里按供应商计数;按调用次数的自动轮换在这里触发。
   // 注意:该瀑布不 await 监听器返回值——监听器必须同步返回 AsyncIterable,
@@ -893,24 +957,32 @@ export function apply(ctx, config) {
       // 请求体上限:状态视图与动作参数都很小,1 MiB 足够并防御滥用。
       // 按 Buffer 收集再统一解码:逐块 += 会把跨块的多字节 UTF-8 打碎成 U+FFFD
       // (中文别名/批量文本常见);close/error 都要 resolve,destroy 后才不会挂死。
+      const MAX_BODY_BYTES = 1024 * 1024
       const chunks = []
       let received = 0
       let oversized = false
+      let finishBody
+      const bodyReady = new Promise(resolve => { finishBody = resolve })
       req.on('data', (chunk) => {
-        chunks.push(chunk)
         received += chunk.length
-        if (received > 1024 * 1024) {
+        if (received > MAX_BODY_BYTES) {
+          // 超限后不再累积也不再继续读:先把 413 回给客户端再断开。
+          // 先 destroy 再回响应的话,客户端只会看到连接重置,拿不到 413。
           oversized = true
-          req.destroy()
+          req.pause()
+          finishBody()
+          return
         }
+        chunks.push(chunk)
       })
-      await new Promise((resolve) => {
-        req.on('end', resolve)
-        req.on('error', resolve)
-        req.on('close', resolve)
-      })
+      req.on('end', finishBody)
+      req.on('error', finishBody)
+      req.on('close', finishBody)
+      await bodyReady
       if (oversized) {
-        sendJson(413, { ok: false, error: '请求体过大' })
+        // 响应写完再断开连接:保证客户端能收到 413。
+        res.writeHead(413, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ ok: false, error: '请求体过大' }), () => { req.destroy() })
         return
       }
       let body
