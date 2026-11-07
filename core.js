@@ -301,6 +301,25 @@ export function shouldRotateInterval(rotation, lastRotatedAt, now) {
   return now - base >= rotation.intervalMs
 }
 
+/* --------------------------- 后台探测调度 --------------------------- */
+
+/**
+ * 后台探测的轮次节奏:第 0 轮(启动首探)立即执行,之后每轮等待 intervalMs。
+ *
+ * 把"启动立即"表达成 0 延迟而不是拆成两段循环:轮次序号本身就是调度
+ * 策略,单测可以直接断言首轮不等待。
+ *
+ * @param round 已完成的轮次序号(启动首探之前为 0)
+ * @param intervalMs 配置的轮间隔(毫秒)
+ * @returns 距下一轮开始的等待毫秒数(0 表示立即执行)
+ */
+export function probeRoundDelay(round, intervalMs) {
+  if (!Number.isFinite(round) || round <= 0) return 0
+  const value = Number.isFinite(intervalMs) ? Math.round(intervalMs) : 0
+  // 下限 1 分钟:配置写坏时也不能把厂商端点打成轮询风暴。
+  return Math.max(60_000, value)
+}
+
 /**
  * 解析批量粘贴的密钥文本:每行一个密钥。
  *

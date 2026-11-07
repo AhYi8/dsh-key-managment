@@ -8,6 +8,7 @@ import {
   nextAlias,
   normalizeState,
   parseAction,
+  probeRoundDelay,
   projectProvider,
   tailOf,
   validateAlias,
@@ -194,6 +195,25 @@ test('shouldRotateCalls 与 shouldRotateInterval 判定', async () => {
   assert.equal(shouldRotateInterval(interval, 0, 1_000_000), false)
   assert.equal(shouldRotateInterval(interval, 1_000_000, 1_000_000 + 599_999), false)
   assert.equal(shouldRotateInterval(interval, 1_000_000, 1_000_000 + 600_000), true)
+})
+
+test('probeRoundDelay:首轮立即,之后按间隔且不低于 1 分钟', () => {
+  // 第 0 轮(启动首探)不等待,间隔写坏也不能挡住启动首探。
+  assert.equal(probeRoundDelay(0, 1_800_000), 0)
+  assert.equal(probeRoundDelay(0, 0), 0)
+  assert.equal(probeRoundDelay(0, Number.NaN), 0)
+  assert.equal(probeRoundDelay(-1, 1_800_000), 0)
+  assert.equal(probeRoundDelay(Number.NaN, 1_800_000), 0)
+  // 之后每轮等待配置的间隔。
+  assert.equal(probeRoundDelay(1, 1_800_000), 1_800_000)
+  assert.equal(probeRoundDelay(3, 300_000), 300_000)
+  assert.equal(probeRoundDelay(2, 86_400_000), 86_400_000)
+  // 间隔被写坏时钳回 1 分钟下限,避免打成轮询风暴。
+  assert.equal(probeRoundDelay(1, 1), 60_000)
+  assert.equal(probeRoundDelay(1, 0), 60_000)
+  assert.equal(probeRoundDelay(1, -5), 60_000)
+  assert.equal(probeRoundDelay(1, Number.NaN), 60_000)
+  assert.equal(probeRoundDelay(1, Number.POSITIVE_INFINITY), 60_000)
 })
 
 test('parseAction 校验请求体', () => {

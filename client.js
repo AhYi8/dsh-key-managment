@@ -1133,6 +1133,16 @@ window.__ModuleLoader__.load({
       h('span', null, `${t('managedBadge')} · ${managed.keyCount}`))
     }
 
+    /**
+     * 组内间隔按 100 毫秒取整:schema 限定步长为 100,
+     * 用户填 250 这类值会被宿主拒掉并弹出未翻译的英文报错。
+     */
+    function snapProbeGap(value) {
+      const number = Number(value)
+      if (!Number.isFinite(number)) return 200
+      return Math.min(60_000, Math.max(200, Math.round(number / 100) * 100))
+    }
+
     /** 插件详情页配置卡:探测开关 + 后台间隔 + 组内间隔。 */
     function ConfigCard() {
       const [values, setValues] = useState(null)
@@ -1226,7 +1236,7 @@ window.__ModuleLoader__.load({
               step: 100,
               value: values.quotaProbeGapMs,
               disabled: values.quotaProbe !== true,
-              onChange: event => setValues(prev => ({ ...prev, quotaProbeGapMs: Math.max(200, Number(event.target.value) || 200) })),
+              onChange: event => setValues(prev => ({ ...prev, quotaProbeGapMs: snapProbeGap(event.target.value) })),
               onBlur: () => save({ quotaProbeGapMs: values.quotaProbeGapMs }),
               style: numberStyle,
             }),

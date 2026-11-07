@@ -13,6 +13,7 @@
  * 只做手动轮换:没有自动故障转移、重试或冷却策略(需求裁剪)。
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { probeKey } from './quota-bridge.js'
@@ -31,6 +32,7 @@ import {
   parseAction,
   parseBatchEntries,
   pickNextKeyId,
+  probeRoundDelay,
   projectProvider,
   shouldRotateCalls,
   shouldRotateInterval,
@@ -106,6 +108,8 @@ export function apply(ctx, config) {
   const quotaPath = join(dirname(statePath), 'key-managment-quota.json')
   /** 后台探测轮的运行标志:防止上一轮未结束时叠加新一轮。 */
   let backgroundProbing = false
+  /** 实例是否已被卸载:卸载后不再探测与落盘,避免旧实例覆盖新实例的状态。 */
+  let disposed = false
   /** 配置编辑器;由 ctx.inject 异步补齐。 */
   let configEditor = undefined
 
@@ -128,6 +132,15 @@ export function apply(ctx, config) {
     ctx.warn?.(`初始化失败: ${error?.message ?? error}`)
   })
 
+  /**
+   * 启动闸门:首次扫描尝试结束后放行后台探测。
+   *
+   * 启动首轮必须等 settings 到位,否则探测拿不到供应商 profile,
+   * 会打到目录默认端点、得到与实际账户无关的余额。
+   */
+  let releaseStartup
+  const startupReady = new Promise(resolve => { releaseStartup = resolve })
+
   /** 首次扫描标记;失败可由下一次 API 调用重试。 */
   let scanned = false
   async function ensureScanned() {
@@ -139,9 +152,19 @@ export function apply(ctx, config) {
   ctx.effect(() => ctx.inject(['settings'], (scope) => {
     settings = scope.settings
     // settings 到位后补扫一次(启动时它可能还没挂上)。
-    void ensureScanned().catch((error) => {
-      ctx.warn?.(`扫描失败(可在界面手动刷新): ${error?.message ?? error}`)
-    })
+    void (async () => {
+      // 等状态读盘完成再扫:否则 state.providers 还是空的,
+      // 已纳管的供应商会被当成"可纳管"重新出现。
+      await ready.catch(() => {})
+      try {
+        await ensureScanned()
+      } catch (error) {
+        ctx.warn?.(`扫描失败(可在界面手动刷新): ${error?.message ?? error}`)
+      } finally {
+        // 扫描尝试结束(成功或失败):放行后台探测的启动首轮。
+        releaseStartup()
+      }
+    })()
     return () => { settings = undefined }
   }), 'dsh-key-managment: settings 获取')
 
@@ -149,6 +172,9 @@ export function apply(ctx, config) {
     configEditor = scope.configEditor
     return () => { configEditor = undefined }
   }), 'dsh-key-managment: configEditor 获取')
+
+  // 卸载标记:插件被移除/重载时置位,让在飞的后台轮主动放弃本轮。
+  ctx.effect(() => () => { disposed = true }, 'dsh-key-managment: 卸载标记')
 
   async function readStateFile(path) {
     try {
@@ -167,7 +193,9 @@ export function apply(ctx, config) {
   let persistTail = Promise.resolve()
   function persist() {
     persistTail = persistTail.then(async () => {
-      const tempPath = `${statePath}.tmp`
+      // 临时文件逐次唯一:插件重载时新旧实例可能同时落盘,
+      // 共用同一个临时文件会互相截断,写出半截 JSON 把状态写坏。
+      const tempPath = `${statePath}.${randomUUID()}.tmp`
       await writeFile(tempPath, JSON.stringify(state, null, 2), 'utf8')
       await rename(tempPath, statePath)
     })
@@ -222,7 +250,8 @@ export function apply(ctx, config) {
   /** 余额快照落盘:原子写,失败只留日志(快照可重建,不值得打断请求)。 */
   async function persistQuota() {
     try {
-      const tempPath = `${quotaPath}.tmp`
+      // 与状态文件同理:临时名逐次唯一,避免并发写互相截断。
+      const tempPath = `${quotaPath}.${randomUUID()}.tmp`
       await writeFile(tempPath, JSON.stringify(Object.fromEntries(quotaStore), null, 2), 'utf8')
       await rename(tempPath, quotaPath)
     } catch (error) {
@@ -246,6 +275,7 @@ export function apply(ctx, config) {
    */
   async function backgroundPass() {
     if (backgroundProbing) return
+    if (disposed) return
     if (live(config, 'quotaProbe', true) !== true) return
     backgroundProbing = true
     try {
@@ -253,6 +283,8 @@ export function apply(ctx, config) {
       let stateDirty = false
       let first = true
       for (const listed of Object.values(state.providers)) {
+        // 卸载后放弃本轮:继续探测并落盘会把旧实例的状态覆盖到新实例上。
+        if (disposed) return
         // 每次迭代重新按 provider 取记录:dispatch 的原位重读会替换
         // state.providers,持有旧对象会让健康写静默丢失(审查 P0-1)。
         const record = recordOf(listed.provider)
@@ -282,15 +314,24 @@ export function apply(ctx, config) {
     }
   }
 
-  // 后台定时探测:每轮开始重读配置,改间隔下一轮即生效(默认 30 分钟)。
+  // 后台定时探测:启动即探一轮,之后每轮开始重读配置
+  // (改间隔下一轮即生效,默认 30 分钟)。
   ctx.effect(() => {
     let stopped = false
     void (async () => {
+      // 等状态读盘 + 首次扫描结束再开跑:否则探测拿不到供应商 profile。
+      await startupReady
+      if (stopped) return
+      let round = 0
       while (!stopped) {
-        const intervalMs = Math.max(60_000, live(config, 'quotaIntervalMs', 1_800_000))
-        await new Promise(resolve => setTimeout(resolve, intervalMs))
-        if (stopped) break
+        // 第 0 轮不等待:进程刚起来立刻探一次,之后才按间隔轮转。
+        const delayMs = probeRoundDelay(round, live(config, 'quotaIntervalMs', 1_800_000))
+        if (delayMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, delayMs))
+          if (stopped) break
+        }
         await backgroundPass()
+        round += 1
       }
     })()
     return () => { stopped = true }
@@ -640,6 +681,16 @@ export function apply(ctx, config) {
     if (patch.quotaProbeGapMs !== undefined
       && (typeof patch.quotaProbeGapMs !== 'number' || patch.quotaProbeGapMs < 200 || patch.quotaProbeGapMs > 60_000)) {
       throw new Error('quotaProbeGapMs 必须是 200-60000 之间的数字')
+    }
+    // schema 对这两个字段有步长约束(轮间隔按整分钟、组内间隔按 100ms):
+    // 不满足时宿主会抛英文原文错误,这里先给出中文提示。
+    if (patch.quotaIntervalMs !== undefined && typeof patch.quotaIntervalMs === 'number'
+      && patch.quotaIntervalMs % 60_000 !== 0) {
+      throw new Error('quotaIntervalMs 必须是 60000 的倍数(整分钟)')
+    }
+    if (patch.quotaProbeGapMs !== undefined && typeof patch.quotaProbeGapMs === 'number'
+      && patch.quotaProbeGapMs % 100 !== 0) {
+      throw new Error('quotaProbeGapMs 必须是 100 的倍数')
     }
     const entry = ctx.fiber?.entry
     if (entry === undefined || configEditor === undefined) {
