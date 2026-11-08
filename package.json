@@ -1,9 +1,19 @@
 {
   "name": "dsh-key-managment",
-  "version": "1.0.0",
-  "private": true,
+  "version": "1.0.1",
   "type": "module",
   "description": "Per-provider API key pool with manual switching for DSH providers",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AhYi8/dsh-key-managment.git"
+  },
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin"
+  ],
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.5"
   },
