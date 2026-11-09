@@ -169,26 +169,53 @@ export function normalizeState(raw) {
 }
 
 /**
- * 把内存里的运行时请求计数合并进"刚读自磁盘"的状态(原位修改)。
+ * 把内存里的运行时状态合并进"刚读自磁盘"的状态(原位修改)。
  *
  * requestCount 是本进程累计的调用数,磁盘上只是上次落盘时的快照:
  * 定时同步(每 60 秒)与变更动作前的同步都会用磁盘状态覆盖内存状态,
  * 若整体采用磁盘值,计数会被反复清零,"按调用次数轮换"永远攒不满阈值。
- * 轮换**配置**仍然以磁盘为准(陈旧实例自愈),这里只保留计数。
+ *
+ * 健康判定同理:磁盘上是上次落盘的快照,内存里是最近一次探测的结论。
+ * 同步若整体采用磁盘值,后台轮刚探测出的结论会被旧快照覆盖——
+ * 表现为"额度已用尽,密钥状态却一直不变"。
+ * 内存里的健康状态只有在给出明确结论(ok/limited/invalid)时才覆盖磁盘:
+ * 仍是 unknown(尚未探测)时不覆盖磁盘上已有的结论。
+ *
+ * 轮换**配置**仍然以磁盘为准(陈旧实例自愈),这里只保留运行时状态。
+ *
+ * 磁盘上没有的供应商(内存里刚纳管、尚未落盘)必须保留:丢弃会让池子
+ * 凭空消失,已写入凭据库的密钥变成无主明文,轮换也无从进行。
  *
  * @param memoryProviders 同步前的内存状态
  * @param freshProviders 刚从磁盘读出并规范化的状态(会被原位修改)
  * @returns freshProviders(便于链式调用)
  */
-export function mergeRequestCounts(memoryProviders, freshProviders) {
+export function mergeRuntimeState(memoryProviders, freshProviders) {
   if (memoryProviders === null || typeof memoryProviders !== 'object') return freshProviders
   if (freshProviders === null || typeof freshProviders !== 'object') return freshProviders
   for (const [provider, record] of Object.entries(memoryProviders)) {
     const incoming = freshProviders[provider]
+    if (incoming === undefined) {
+      // 磁盘上没有这个供应商:内存里的那份更可能是刚纳管还没落盘的,
+      // 保留它,免得池子凭空消失(凭据已写入凭据库,丢不得)。
+      freshProviders[provider] = record
+      continue
+    }
     if (incoming === null || typeof incoming !== 'object') continue
     const memory = Number(record?.requestCount ?? 0)
     const disk = Number(incoming.requestCount ?? 0)
     if (Number.isFinite(memory) && memory > disk) incoming.requestCount = memory
+    const memoryKeys = Array.isArray(record?.keys) ? record.keys : []
+    const incomingKeys = Array.isArray(incoming.keys) ? incoming.keys : []
+    for (const memoryKey of memoryKeys) {
+      if (memoryKey === null || typeof memoryKey !== 'object') continue
+      if (memoryKey.health !== 'ok' && memoryKey.health !== 'limited' && memoryKey.health !== 'invalid') continue
+      const target = incomingKeys.find(entry => entry !== null && typeof entry === 'object' && entry.id === memoryKey.id)
+      if (target === undefined) continue
+      target.health = memoryKey.health
+      target.cooldownUntil = memoryKey.cooldownUntil ?? 0
+      target.cooldownLevel = memoryKey.cooldownLevel ?? 0
+    }
   }
   return freshProviders
 }
@@ -291,7 +318,11 @@ export function findKeyByDigest(record, digests, currentDigest) {
 
 /* ------------------------- 密钥健康状态与自动轮换 ------------------------- */
 
-/** 限流冷却的起步时长与上限(指数退避:60s 起步,翻倍,封顶 30 分钟)。 */
+/**
+ * 限流冷却的起步时长与上限(指数退避:60s 为基数,每次连续限流翻倍,封顶 30 分钟)。
+ *
+ * 注意实际首次退避是 120s:冷却时长按 `基数 × 2^级别` 计算,而级别从 1 起算。
+ */
 export const LIMIT_COOLDOWN_BASE_MS = 60_000
 export const LIMIT_COOLDOWN_MAX_MS = 30 * 60_000
 
@@ -302,16 +333,19 @@ export const LIMIT_COOLDOWN_MAX_MS = 30 * 60_000
  * - ok 但存在 100% 用尽的窗口    → limited(限流),冷却到窗口重置时间
  * - 探测错误 kind=rate / 429     → limited,指数退避冷却
  * - 探测错误 kind=auth / 无凭据  → invalid(无效)
- * - 其它错误(parse/network)     → 保持原状态
+ * - 其它错误(parse/network)     → 保持原状态(健康状态与冷却时间都不动)
  *
  * @param payload 探测负载(quotaStore 里的快照)
  * @param prev 上一次的健康状态;首次为 'unknown'
  * @param prevLevel 上一次限流的退避级别
  * @param now 当前时间戳
+ * @param prevCooldown 上一次的冷却截止时间;"保持原状态"时原样保留。
+ *   少了它,一次探测失败(网络抖动)会把仍在冷却中的密钥立刻放回可选池,
+ *   指数退避形同虚设。
  */
-export function healthFromQuota(payload, prev, prevLevel, now) {
+export function healthFromQuota(payload, prev, prevLevel, now, prevCooldown = 0) {
   if (payload === undefined || payload === null) {
-    return { health: prev ?? 'unknown', cooldownUntil: 0, level: prevLevel ?? 0 }
+    return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0 }
   }
   if (payload.status === 'ok') {
     const windows = Array.isArray(payload.windows) ? payload.windows : []
@@ -336,11 +370,47 @@ export function healthFromQuota(payload, prev, prevLevel, now) {
       const cooldownMs = Math.min(LIMIT_COOLDOWN_MAX_MS, LIMIT_COOLDOWN_BASE_MS * 2 ** level)
       return { health: 'limited', cooldownUntil: now + cooldownMs, level }
     }
-    // parse/network 等:探测自身问题,不改判密钥。
-    return { health: prev ?? 'unknown', cooldownUntil: 0, level: prevLevel ?? 0 }
+    // parse/network 等:探测自身问题,不改判密钥——冷却时间也原样保留。
+    return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0 }
   }
   // unsupported 等:维持原状。
-  return { health: prev ?? 'unknown', cooldownUntil: 0, level: prevLevel ?? 0 }
+  return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0 }
+}
+
+/**
+ * 用一次探测结论落定某把密钥的健康状态,写回"当前内存态"里的那把密钥。
+ *
+ * 后台探测一轮要串行扫全部供应商,单是 minimax-cn 的 50 把密钥 × 5 秒
+ * 组内间隔就要 4 分多钟。这期间"以磁盘为准"的定时同步会整体替换
+ * state.providers,先前持有的 key 引用便成了孤儿——写进孤儿的结论
+ * 不会进入下一次落盘,表现为"额度已用尽,状态却一直不变"。
+ * 因此这里按 id 重新定位当前内存态里的那把密钥:判定用的前值也取自
+ * 活对象(限流退避级别才能连续累加),结论也必然落在活对象上。
+ *
+ * @param providers 当前内存态的供应商集合(state.providers)
+ * @param provider 供应商键
+ * @param keyId 池内密钥 id
+ * @param payload 探测负载(quotaStore 里的快照)
+ * @param now 当前时间戳
+ * @returns { changed: boolean, health: string } changed 表示状态确实变了(需要落盘)
+ */
+export function settleKeyHealth(providers, provider, keyId, payload, now) {
+  const record = providers?.[provider]
+  if (record === undefined || !Array.isArray(record.keys)) return { changed: false, health: 'unknown' }
+  const key = record.keys.find(entry => entry?.id === keyId)
+  if (key === undefined) return { changed: false, health: 'unknown' }
+  const verdict = healthFromQuota(payload, key.health ?? 'unknown', key.cooldownLevel ?? 0, now, key.cooldownUntil ?? 0)
+  // 退避级别也要比较:级别封顶后冷却时长可能相同,但级别仍在增长,
+  // 漏判会让级别不落盘,退避重新从低级别开始。
+  if (key.health === verdict.health
+    && (key.cooldownUntil ?? 0) === verdict.cooldownUntil
+    && (key.cooldownLevel ?? 0) === verdict.level) {
+    return { changed: false, health: verdict.health }
+  }
+  key.health = verdict.health
+  key.cooldownUntil = verdict.cooldownUntil
+  key.cooldownLevel = verdict.level
+  return { changed: true, health: verdict.health }
 }
 
 /**

@@ -18,13 +18,12 @@ import { dirname, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { probeKey } from './quota-bridge.js'
 import {
-  healthFromQuota,
   hitValue,
   isSelectable,
   MAX_KEYS_PER_PROVIDER,
   digestOf,
   findKeyByDigest,
-  mergeRequestCounts,
+  mergeRuntimeState,
   newKeyId,
   newPoolRef,
   newProviderRecord,
@@ -36,6 +35,7 @@ import {
   pickNextKeyId,
   probeRoundDelay,
   projectProvider,
+  settleKeyHealth,
   shouldRotateCalls,
   shouldRotateInterval,
   tailOf,
@@ -251,6 +251,19 @@ export function apply(ctx, config) {
     return state.providers[provider]
   }
 
+  /**
+   * 取当前内存态里某把密钥的活对象。
+   *
+   * "以磁盘为准"的定时同步会整体替换 state.providers,先前持有的
+   * record/key 引用随之成为孤儿——写在孤儿上的健康状态会随落盘丢失。
+   * 需要读写某把密钥的当前状态时,按 id 到这里重新定位。
+   */
+  function liveKeyOf(provider, keyId) {
+    const record = recordOf(provider)
+    if (record === undefined || !Array.isArray(record.keys)) return undefined
+    return record.keys.find(entry => entry?.id === keyId)
+  }
+
   function requireRecord(provider) {
     const record = recordOf(provider)
     if (record === undefined) throw new Error(`供应商 ${provider} 尚未纳管`)
@@ -336,12 +349,14 @@ export function apply(ctx, config) {
       for (const listed of Object.values(state.providers)) {
         // 卸载后放弃本轮:继续探测并落盘会把旧实例的状态覆盖到新实例上。
         if (disposed) return
-        // 每次迭代重新按 provider 取记录:dispatch 的原位重读会替换
+        // 每轮按 provider 重新取活记录:dispatch 与定时同步都会替换
         // state.providers,持有旧对象会让健康写静默丢失(审查 P0-1)。
         const record = recordOf(listed.provider)
         if (record === undefined) continue
         const profile = profileOf(record.provider)
-        for (const key of record.keys) {
+        // 待探列表也取活对象:一轮要探几分钟,期间的同步会换掉密钥集合,
+        // 按旧快照遍历会探到已删除的密钥,残留快照还会被写回余额缓存。
+        for (const key of [...record.keys]) {
           // 卸载后立即放弃本轮:组内间隔动辄数秒,只在 provider 边界检查不够——
           // 继续探测并落盘会把旧实例的状态覆盖到新实例已经写好的文件上。
           if (disposed) return
@@ -350,11 +365,10 @@ export function apply(ctx, config) {
           // force=true:后台轮的目标就是刷新,不被 TTL 短路。
           const payload = await probeKey(ctx, record, key, profile, quotaStore, quotaInflight, true)
           // 探测结果推导健康状态:有效/限流/无效,轮换时据此跳过。
-          const verdict = healthFromQuota(payload, key.health ?? 'unknown', key.cooldownLevel ?? 0, Date.now())
-          if (key.health !== verdict.health || (key.cooldownUntil ?? 0) !== verdict.cooldownUntil) {
-            key.health = verdict.health
-            key.cooldownUntil = verdict.cooldownUntil
-            key.cooldownLevel = verdict.level
+          // 按 id 写回当前内存态的活对象:一轮要探几分钟,期间定时同步
+          // 会整体替换 state.providers,写进旧引用的结论会随落盘丢失。
+          const settled = settleKeyHealth(state.providers, record.provider, key.id, payload, Date.now())
+          if (settled.changed) {
             stateDirty = true
           }
         }
@@ -468,11 +482,16 @@ export function apply(ctx, config) {
     const value = hitValue(await safeResolve(key.ref))
     if (value === undefined) throw new Error('该密钥的值已不可读(可能被外部删除)')
     await ctx.credentials.set(record.keyRef, value)
-    key.lastUsedAt = Date.now()
-    record.activeKeyId = key.id
+    // 上面两次 await 期间定时同步可能已替换 state.providers:
+    // 状态字段一律按 id 回查活对象再写,写进旧引用会随落盘丢失
+    // (界面"生效中"会与真实在用密钥不一致,计数也不清零)。
+    const liveRecord = requireRecord(provider)
+    const liveKey = liveKeyOf(provider, keyId)
+    if (liveKey !== undefined) liveKey.lastUsedAt = Date.now()
+    liveRecord.activeKeyId = keyId
     // 无论手动还是自动轮换,换到新密钥都从零计数、重新计时。
-    record.requestCount = 0
-    record.lastRotatedAt = Date.now()
+    liveRecord.requestCount = 0
+    liveRecord.lastRotatedAt = Date.now()
     await persist()
     return view(provider)
   }
@@ -483,24 +502,35 @@ export function apply(ctx, config) {
    * 选中后推进游标,保证整池循环而不是在两把之间打转。
    */
   async function rotateToNext(provider) {
-    const record = requireRecord(provider)
-    const total = record.keys.length
+    const total = requireRecord(provider).keys.length
     for (let attempt = 0; attempt < total; attempt += 1) {
+      // 每轮重新取活记录:探测期间的 await 可能让 60 秒定时同步整体替换
+      // state.providers,手里的旧 record 会成为孤儿——游标推进与候选判定
+      // 都必须落在活对象上,否则会反复选中同一把密钥。
+      const record = requireRecord(provider)
       const nextId = pickNextKeyId(record, Date.now(), record.activeKeyId ?? undefined)
       if (nextId === undefined) break
       const index = record.keys.findIndex(item => item.id === nextId)
       const key = record.keys[index]
       // 未知候选:先探测一次,探测即落定健康状态(结果同时进余额快照)。
-      if ((key.health ?? 'unknown') === 'unknown') {
+      // 未知与否也读活对象:手里这份 record 可能已是孤儿,它上面的
+      // health 停留在上一次同步前的旧值。
+      const candidate = liveKeyOf(provider, nextId) ?? key
+      if ((candidate.health ?? 'unknown') === 'unknown') {
         const payload = await probeKey(ctx, record, key, profileOf(provider), quotaStore, quotaInflight, true)
-        const verdict = healthFromQuota(payload, key.health ?? 'unknown', key.cooldownLevel ?? 0, Date.now())
-        key.health = verdict.health
-        key.cooldownUntil = verdict.cooldownUntil
-        key.cooldownLevel = verdict.level
+        // 按 id 写回活对象:探测期间定时同步可能已替换 state.providers。
+        settleKeyHealth(state.providers, provider, key.id, payload, Date.now())
       }
-      // 推进游标(无论选不选中,都从这一把之后继续找)。
-      record.cursor = (index + 1) % total
-      if (!isSelectable(key, Date.now())) continue
+      // 推进游标(无论选不选中,都从这一把之后继续找):写活记录,
+      // 否则游标停在旧对象上,池内循环退化成反复选同一把。
+      const liveRecord = requireRecord(provider)
+      const liveIndex = liveRecord.keys.findIndex(item => item.id === nextId)
+      if (liveIndex >= 0) liveRecord.cursor = (liveIndex + 1) % liveRecord.keys.length
+      // 候选判定必须读活对象:上面的探测结论写在活对象上,手里这份
+      // record 可能已是孤儿,照旧读会漏掉"该密钥正在限流"的事实,
+      // 轮换就会选中一把限流中的密钥。
+      const liveKey = liveKeyOf(provider, nextId) ?? key
+      if (!isSelectable(liveKey, Date.now())) continue
       try {
         await activate(provider, nextId)
         return true
@@ -508,10 +538,14 @@ export function apply(ctx, config) {
         // 选中密钥的值不可读(ref 被外部删除等):标记无效并尝试下一把,
         // 不能让单个坏候选中断整池轮换(审查 P1-6)。
         ctx.warn?.(`轮换选中 ${key.alias} 失败,标记无效并跳过: ${error?.message ?? error}`)
-        key.health = 'invalid'
-        key.cooldownUntil = 0
-        key.cooldownLevel = 0
-        record.requestCount = 0
+        // 同样写活对象:孤儿上的标记会随落盘丢失,坏密钥将永远保持可用。
+        const target = liveKeyOf(provider, nextId) ?? key
+        target.health = 'invalid'
+        target.cooldownUntil = 0
+        target.cooldownLevel = 0
+        // 计数同样要写在活记录上:写进旧对象就清不掉,
+        // 阈值持续满足 → 之后每个请求都触发一次轮换。
+        requireRecord(provider).requestCount = 0
         await persist()
       }
     }
@@ -558,9 +592,13 @@ export function apply(ctx, config) {
     const ref = newPoolRef(record.provider)
     await ctx.credentials.set(ref, value)
     createdRefs?.push(ref)
-    record.keys.push({
+    // 上面 await 期间定时同步可能已替换 state.providers:
+    // push 进旧数组等于没加——活池子里没这把,凭据却留在凭据库成了无主明文。
+    // 按 provider 回查活记录再写入。
+    const liveRecord = requireRecord(record.provider)
+    liveRecord.keys.push({
       id: newKeyId(),
-      alias: alias?.trim() || nextAlias(record.keys),
+      alias: alias?.trim() || nextAlias(liveRecord.keys),
       ref,
       createdAt: Date.now(),
       lastUsedAt: 0,
@@ -646,7 +684,12 @@ export function apply(ctx, config) {
       // 原引用值就是这把时,禁止删除:它还在为实际请求服务。
       throw new Error('生效中的密钥不能删除;先切换到其他密钥')
     }
-    record.keys.splice(index, 1)
+    // 上面 await 期间定时同步可能已替换 state.providers:
+    // splice 旧数组等于没删——活池子里这把还在,凭据却已删,界面会留一把死密钥。
+    // 按 provider 回查活记录再删。
+    const liveRecord = requireRecord(provider)
+    const liveIndex = liveRecord.keys.findIndex(entry => entry.id === keyId)
+    if (liveIndex >= 0) liveRecord.keys.splice(liveIndex, 1)
     // 同步清掉余额快照:否则残留条目随 view 永久下发,无界增长(审查 P2-1)。
     quotaStore.delete(`${provider}\u0000${key.id}`)
     try {
@@ -722,11 +765,8 @@ export function apply(ctx, config) {
     const payload = await probeKey(ctx, record, key, profileOf(provider), quotaStore, quotaInflight, force === true)
     // 手动探测也要落定健康状态:否则徽标(来自状态文件)与圆环(来自本次探测)
     // 会各说各话——圆环已经报"密钥无效",徽标还挂着"有效"。
-    const verdict = healthFromQuota(payload, key.health ?? 'unknown', key.cooldownLevel ?? 0, Date.now())
-    if (key.health !== verdict.health || (key.cooldownUntil ?? 0) !== verdict.cooldownUntil) {
-      key.health = verdict.health
-      key.cooldownUntil = verdict.cooldownUntil
-      key.cooldownLevel = verdict.level
+    const settled = settleKeyHealth(state.providers, provider, key.id, payload, Date.now())
+    if (settled.changed) {
       await persist()
     }
     await persistQuota()
@@ -784,7 +824,7 @@ export function apply(ctx, config) {
    */
   async function syncProvidersFromDisk() {
     const fresh = normalizeState(await readStateFile(statePath))
-    state.providers = mergeRequestCounts(state.providers, fresh.providers)
+    state.providers = mergeRuntimeState(state.providers, fresh.providers)
   }
 
   /** 动作分派;所有变更动作串行执行。 */

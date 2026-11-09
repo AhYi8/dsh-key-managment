@@ -23,11 +23,15 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
+  "scripts": {
+    "test": "node --test core.test.mjs quota.test.mjs"
+  },
   "files": [
     "index.js",
     "core.js",
     "client.js",
     "core.test.mjs",
+    "quota.test.mjs",
     "quota-bridge.js",
     "quota/**/*.js",
     "quota/NOTICE.md",
