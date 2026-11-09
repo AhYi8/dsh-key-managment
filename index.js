@@ -388,6 +388,9 @@ export function apply(ctx, config) {
   // (改间隔下一轮即生效,默认 30 分钟)。
   ctx.effect(() => {
     let stopped = false
+    // 挂起的等待定时器:卸载时要一并取消,否则进程会多等一个轮间隔
+    // (默认 30 分钟)才退出——清理函数只置停止标志取消不了它。
+    let pending = undefined
     void (async () => {
       // 等状态读盘 + 首次扫描结束再开跑:否则探测拿不到供应商 profile。
       await startupReady
@@ -397,14 +400,23 @@ export function apply(ctx, config) {
         // 第 0 轮不等待:进程刚起来立刻探一次,之后才按间隔轮转。
         const delayMs = probeRoundDelay(round, live(config, 'quotaIntervalMs', 1_800_000))
         if (delayMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, delayMs))
+          await new Promise(resolve => {
+            pending = setTimeout(resolve, delayMs)
+          })
+          pending = undefined
           if (stopped) break
         }
         await backgroundPass()
         round += 1
       }
     })()
-    return () => { stopped = true }
+    return () => {
+      stopped = true
+      if (pending !== undefined) {
+        clearTimeout(pending)
+        pending = undefined
+      }
+    }
   }, 'dsh-key-managment: 后台余额探测定时器')
 
   /**
@@ -614,8 +626,11 @@ export function apply(ctx, config) {
       for (const ref of createdRefs) {
         try { await ctx.credentials.unset(ref) } catch { /* 尽力清理 */ }
       }
-      // 回滚内存态,保持与磁盘一致。
-      record.keys = record.keys.filter(key => !createdRefs.includes(key.ref))
+      // 回滚内存态,保持与磁盘一致。注意要回滚**活记录**:
+      // addKeyEntry 把新密钥 push 进了活记录,回滚旧记录等于没回滚——
+      // 凭据已删,池子里却留着这把指向空凭据的密钥。
+      const liveRecord = recordOf(record.provider) ?? record
+      liveRecord.keys = liveRecord.keys.filter(key => !createdRefs.includes(key.ref))
       throw error
     }
   }

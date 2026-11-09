@@ -1,6 +1,6 @@
 {
   "name": "dsh-key-managment",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "Per-provider API key pool with manual switching for DSH providers",
   "repository": {
@@ -24,7 +24,7 @@
     "./icon": "./icon.svg"
   },
   "scripts": {
-    "test": "node --test core.test.mjs quota.test.mjs"
+    "test": "node --test --test-timeout=30000 core.test.mjs quota.test.mjs index.test.mjs timer.test.mjs"
   },
   "files": [
     "index.js",
@@ -32,6 +32,8 @@
     "client.js",
     "core.test.mjs",
     "quota.test.mjs",
+    "index.test.mjs",
+    "timer.test.mjs",
     "quota-bridge.js",
     "quota/**/*.js",
     "quota/NOTICE.md",
