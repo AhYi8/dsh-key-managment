@@ -22,16 +22,19 @@ import { QuotaQueryError } from "../types.js";
 const ROUTE_OFFICIAL = 'deepseek-official';
 /** Default inference/quota host when the profile carries no override. */
 const DEFAULT_BASE = 'https://api.deepseek.com';
+// 官方 `deepseek-official` 的推理根是 Messages 的 `/anthropic`,与 `/v1` 一样
+// 要剥掉:显式配置 baseURL 时否则会请求 `/anthropic/user/balance` 拿到 404。
+// 代理前缀仍保留(`https://gw.example/deepseek/anthropic` → `…/deepseek/user/balance`)。
 /**
  * The platform root a balance query should hit: strip trailing slashes and
- * a trailing OpenAI-compatible `/v1` so a profile of
- * `https://api.deepseek.com/v1` lands on `/user/balance`, not
+ * a trailing OpenAI-compatible `/v1` (or the Messages `/anthropic` root) so a
+ * profile of `https://api.deepseek.com/v1` lands on `/user/balance`, not
  * `/v1/user/balance`. A proxy path in front of `/v1` is kept
  * (`https://gw.example/deepseek/v1` → `…/deepseek/user/balance`).
  */
 function balanceRootOf(baseUrl) {
     const raw = baseUrl !== undefined && baseUrl !== '' ? baseUrl : DEFAULT_BASE;
-    return raw.replace(/\/+$/u, '').replace(/\/v1$/u, '');
+    return raw.replace(/\/+$/u, '').replace(/\/(?:v1|anthropic)$/u, '');
 }
 /** The DeepSeek API-key balance adapter. */
 export const deepseekBalanceAdapter = {
@@ -71,10 +74,14 @@ export const deepseekBalanceAdapter = {
         if (balance === undefined) {
             throw new QuotaQueryError('parse', 'missing numeric "total_balance"');
         }
+        // is_available 是官方对"余额是否够调用"的权威判断:赠金过期等情况
+        // 可能余额仍为正却不可用,所以随窗口一起带出,健康判定直接采信。
+        const available = typeof record.is_available === 'boolean' ? record.is_available : undefined;
         const window = {
             tier: 'balance',
             remainingValue: balance,
             unit: entry.currency === 'USD' ? 'usd' : 'cny',
+            ...(available !== undefined ? { available } : {}),
         };
         return { windows: [window] };
     },

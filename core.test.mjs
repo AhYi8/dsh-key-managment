@@ -170,6 +170,40 @@ test('healthFromQuota:按探测结果推导有效/限流/无效', async () => {
   assert.equal(healthFromQuota({ status: 'error', error: { kind: 'parse', message: 'x' } }, 'ok', 0, now).health, 'ok')
 })
 
+test('healthFromQuota:余额型窗口按官方可用性与余额判定', async () => {
+  const { healthFromQuota } = await import('./core.js')
+  const now = 1_000_000
+  // 余额充足 → 有效。
+  assert.equal(healthFromQuota(
+    { status: 'ok', windows: [{ tier: 'balance', remainingValue: 12.34, available: true }] },
+    'ok', 0, now).health, 'ok')
+  // 余额 0 → 限流,固定 10 分钟冷却(余额窗口没有重置时间)。
+  const empty = healthFromQuota(
+    { status: 'ok', windows: [{ tier: 'balance', remainingValue: 0, available: false }] },
+    'ok', 0, now)
+  assert.equal(empty.health, 'limited')
+  assert.equal(empty.cooldownUntil, now + 600_000)
+  // 透支余额是负数,同样不可用。
+  assert.equal(healthFromQuota(
+    { status: 'ok', windows: [{ tier: 'balance', remainingValue: -0.01, available: false }] },
+    'ok', 0, now).health, 'limited')
+  // 官方 is_available=false 是权威判断:即使余额为正也不可用。
+  assert.equal(healthFromQuota(
+    { status: 'ok', windows: [{ tier: 'balance', remainingValue: 5, available: false }] },
+    'ok', 0, now).health, 'limited')
+  // 旧快照没有 available 字段:仍然按余额判定,不能因为缺字段就放行。
+  assert.equal(healthFromQuota(
+    { status: 'ok', windows: [{ tier: 'balance', remainingValue: 0 }] },
+    'ok', 0, now).health, 'limited')
+  assert.equal(healthFromQuota(
+    { status: 'ok', windows: [{ tier: 'balance', remainingValue: 3 }] },
+    'ok', 0, now).health, 'ok')
+  // 百分比窗口即使意外带 available 字段,也不能被当成余额窗口。
+  assert.equal(healthFromQuota(
+    { status: 'ok', windows: [{ tier: 'five_hour', usedPercent: 50, available: false }] },
+    'ok', 0, now).health, 'ok')
+})
+
 test('healthFromQuota:探测失败时保留原冷却时间与退避级别', async () => {
   const { healthFromQuota } = await import('./core.js')
   const now = 1_000_000

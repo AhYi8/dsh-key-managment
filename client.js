@@ -171,6 +171,33 @@ window.__ModuleLoader__.load({
       return used === undefined ? undefined : 100 - used
     }
 
+    /**
+     * 读余额型窗口(DeepSeek 官方 /user/balance):返回金额与官方可用性。
+     * 这类窗口没有百分比,不能套用 usedPercent/remainingPercent 的展示逻辑。
+     */
+    function balanceWindowOf(payload) {
+      if (payload?.status !== 'ok' || !Array.isArray(payload.windows)) return undefined
+      const win = payload.windows.find(item => item?.tier === 'balance'
+        && typeof item.remainingValue === 'number')
+      if (win === undefined) return undefined
+      return { value: win.remainingValue, unit: win.unit, available: win.available }
+    }
+
+    /** 余额是否已不可用:官方 is_available=false,或余额 ≤0(含透支)。 */
+    function isBalanceEmpty(balance) {
+      if (balance === undefined) return false
+      return balance.available === false || balance.value <= 0
+    }
+
+    /** 金额展示:适配器只产出 cny/usd,未知单位按人民币兜底。 */
+    function formatAmount(value, unit) {
+      const symbol = unit === 'usd' ? '$' : '¥'
+      const abs = Math.abs(value)
+      // 余额可能只有几分钱,保留两位;上千后小数没有意义,取整避免撑破弹层。
+      const text = abs >= 1000 ? abs.toFixed(0) : abs.toFixed(2)
+      return `${value < 0 ? '-' : ''}${symbol}${text}`
+    }
+
     /** 剩余额度的分档色:剩余 <10% 红、<30% 黄、否则绿。 */
     function remainingColor(remaining) {
       if (remaining === undefined) return 'var(--dsw-alias-fg-tertiary, #777)'
@@ -205,21 +232,29 @@ window.__ModuleLoader__.load({
       const wrapRef = useRef(null)
       useOutside(open, wrapRef, () => setOpen(false))
       const payload = props.payload
+      const balance = balanceWindowOf(payload)
+      const balanceEmpty = isBalanceEmpty(balance)
       // 展示语义与 token-usage 一致:环与数字都是"剩余额度"。
-      const remaining = remainingPercentOf(payload)
+      // 余额型窗口没有百分比,环改为金额状态,不能画成 100% 误导用户。
+      const remaining = balance === undefined ? remainingPercentOf(payload) : undefined
       const remainingRatio = remaining !== undefined ? remaining / 100 : undefined
       const radius = 7
       const circumference = 2 * Math.PI * radius
-      const color = remainingColor(remaining)
+      const color = balance !== undefined
+        ? (balanceEmpty ? '#d95c5c' : '#4caf78')
+        : remainingColor(remaining)
+      const amountText = balance === undefined ? undefined : formatAmount(balance.value, balance.unit)
       const title = payload === undefined
         ? props.t('quotaLoading')
-        : payload.status === 'ok' && remaining !== undefined
-          ? `${props.t('quotaRemaining')} ${Math.round(remaining)}%`
-          : payload.status === 'unsupported'
-            ? props.t('quotaUnsupported')
-            : payload.status === 'error'
-              ? `${props.t('quotaError')}: ${payload.error?.message ?? ''}`
-              : props.t('quotaLoading')
+        : balance !== undefined
+          ? (balanceEmpty ? props.t('quotaBalanceEmpty') : `${props.t('quota')} ${amountText}`)
+          : payload.status === 'ok' && remaining !== undefined
+            ? `${props.t('quotaRemaining')} ${Math.round(remaining)}%`
+            : payload.status === 'unsupported'
+              ? props.t('quotaUnsupported')
+              : payload.status === 'error'
+                ? `${props.t('quotaError')}: ${payload.error?.message ?? ''}`
+                : props.t('quotaLoading')
       return h('div', { ref: wrapRef, style: { position: 'relative', display: 'inline-flex', flex: 'none' } },
         h('button', {
           onClick: () => setOpen(value => !value),
@@ -243,8 +278,18 @@ window.__ModuleLoader__.load({
             cx: 9, cy: 9, r: radius, fill: 'none',
             stroke: 'var(--dsw-alias-border-secondary, #333)',
             strokeWidth: 2.5,
-            strokeDasharray: payload?.status === 'error' ? '2 3' : undefined,
+            // 余额不可用时用虚线,与错误态一致,提示"不是百分比进度"。
+            strokeDasharray: payload?.status === 'error' || (balance !== undefined && balanceEmpty) ? '2 3' : undefined,
           }),
+          // 余额型窗口画整圈表示"已充值";颜色只区分可用(绿)/不足(红),
+          // 金额本身在 title 与明细弹层里给出。
+          balance !== undefined ? h('circle', {
+            cx: 9, cy: 9, r: radius, fill: 'none',
+            stroke: color,
+            strokeWidth: 2.5,
+            strokeLinecap: 'round',
+            strokeDasharray: balanceEmpty ? '2 3' : undefined,
+          }) : null,
           remainingRatio !== undefined ? h('circle', {
             cx: 9, cy: 9, r: radius, fill: 'none',
             stroke: color,
@@ -258,12 +303,17 @@ window.__ModuleLoader__.load({
               x: 9, y: 9, textAnchor: 'middle', dominantBaseline: 'central',
               fontSize: 5.5, fill: color,
             }, String(Math.round(remaining)))
-            : payload?.status === 'unsupported'
+            : balance !== undefined
               ? h('text', {
                 x: 9, y: 9, textAnchor: 'middle', dominantBaseline: 'central',
-                fontSize: 8, fill: 'var(--dsw-alias-fg-tertiary, #777)',
-              }, '?')
-              : null,
+                fontSize: 7, fill: color,
+              }, balanceEmpty ? '!' : (balance.unit === 'usd' ? '$' : '¥'))
+              : payload?.status === 'unsupported'
+                ? h('text', {
+                  x: 9, y: 9, textAnchor: 'middle', dominantBaseline: 'central',
+                  fontSize: 8, fill: 'var(--dsw-alias-fg-tertiary, #777)',
+                }, '?')
+                : null,
         )),
         // tooltip 式明细弹层:列各窗口用量 + 立即刷新(纯图标)。
         open ? h(Popover, { minWidth: 230, flip: props.flip, onClose: () => setOpen(false) },
@@ -284,6 +334,19 @@ window.__ModuleLoader__.load({
             ? h('div', { style: { opacity: 0.7 } }, props.t('quotaLoading'))
             : payload.status === 'ok'
               ? (payload.windows ?? []).map((win, index) => {
+                // 余额型窗口:展示金额与可用性,没有百分比条和重置时间。
+                if (win?.tier === 'balance') {
+                  const amount = typeof win.remainingValue === 'number'
+                    ? formatAmount(win.remainingValue, win.unit)
+                    : '-'
+                  const empty = win.available === false
+                    || (typeof win.remainingValue === 'number' && win.remainingValue <= 0)
+                  return h('div', { key: `${win.tier}-${index}`, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                    h('div', { style: { display: 'flex', justifyContent: 'space-between' } },
+                      h('span', null, props.t('quota')),
+                      h('strong', { style: { color: empty ? '#d95c5c' : '#4caf78' } }, amount)),
+                    empty ? h('div', { style: { opacity: 0.7 } }, props.t('quotaBalanceEmpty')) : null)
+                }
                 const used = typeof win.usedPercent === 'number'
                   ? win.usedPercent
                   : typeof win.remainingPercent === 'number' ? win.remainingPercent : undefined
@@ -734,9 +797,17 @@ window.__ModuleLoader__.load({
             ? h(Chip, { label: t('active'), color: 'var(--dsw-alias-fg-tertiary, #999)' })
             : null
           // 健康状态徽章:有效(绿)/限流(黄,含冷却剩余)/无效(红)/未知(灰)。
+          // 余额型窗口为 0 时显示"余额不足",避免把"账户没钱"误报成"限流"。
+          const keyBalance = balanceWindowOf(quotas[key.id])
+          const keyBalanceEmpty = isBalanceEmpty(keyBalance)
           const healthInfo = {
             ok: { label: t('healthOk'), color: '#4caf78' },
-            limited: { label: key.limited ? `${t('healthLimited')} ${formatReset(key.cooldownUntil)}` : t('healthOk'), color: '#d9a13c' },
+            limited: {
+              label: key.limited
+                ? (keyBalanceEmpty ? t('quotaBalanceEmpty') : `${t('healthLimited')} ${formatReset(key.cooldownUntil)}`)
+                : t('healthOk'),
+              color: keyBalanceEmpty ? '#d95c5c' : '#d9a13c',
+            },
             invalid: { label: t('healthInvalid'), color: '#d95c5c' },
             unknown: { label: t('healthUnknown'), color: 'var(--dsw-alias-fg-tertiary, #999)' },
           }[key.health ?? 'unknown']
@@ -1408,6 +1479,7 @@ window.__ModuleLoader__.load({
         quotaUnsupported: '该供应商暂不支持余额探测',
         quotaError: '探测失败',
         quotaLoading: '正在探测余额…',
+        quotaBalanceEmpty: '余额不足',
         quotaRemaining: '剩余',
         quotaRefresh: '立即刷新',
         quotaFetchedAt: '探测于',
@@ -1469,6 +1541,7 @@ window.__ModuleLoader__.load({
         quotaUnsupported: 'Quota probing is not supported for this provider',
         quotaError: 'Probe failed',
         quotaLoading: 'Probing quota…',
+        quotaBalanceEmpty: 'Insufficient balance',
         quotaRemaining: 'remaining',
         quotaRefresh: 'Refresh now',
         quotaFetchedAt: 'Probed at',

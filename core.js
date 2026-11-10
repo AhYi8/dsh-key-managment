@@ -331,6 +331,8 @@ export const LIMIT_COOLDOWN_MAX_MS = 30 * 60_000
  *
  * - ok 且所有窗口用量 <100%      → ok(有效)
  * - ok 但存在 100% 用尽的窗口    → limited(限流),冷却到窗口重置时间
+ * - ok 但余额窗口不可用(余额 ≤0 或 is_available=false)
+ *                                → limited,固定 10 分钟冷却
  * - 探测错误 kind=rate / 429     → limited,指数退避冷却
  * - 探测错误 kind=auth / 无凭据  → invalid(无效)
  * - 其它错误(parse/network)     → 保持原状态(健康状态与冷却时间都不动)
@@ -349,6 +351,15 @@ export function healthFromQuota(payload, prev, prevLevel, now, prevCooldown = 0)
   }
   if (payload.status === 'ok') {
     const windows = Array.isArray(payload.windows) ? payload.windows : []
+    // 余额型窗口(DeepSeek 官方 /user/balance):官方没有百分比和重置时间,
+    // is_available=false 或余额 ≤0(含透支)都视为不可用。不判限流的话,
+    // 轮换会把余额为 0 的密钥当有效密钥选中,切过去只会拿到 402。
+    const overdrawn = windows.find(w => w?.tier === 'balance' && (
+      w.available === false || (typeof w.remainingValue === 'number' && w.remainingValue <= 0)))
+    if (overdrawn !== undefined) {
+      // 余额没有重置时间,给固定 10 分钟冷却;到下一轮探测会重新判定。
+      return { health: 'limited', cooldownUntil: now + 10 * 60_000, level: 0 }
+    }
     const exhausted = windows.filter(w => typeof w.usedPercent === 'number' && w.usedPercent >= 100)
     if (exhausted.length > 0) {
       // 冷却到最早重置的耗尽窗口;缺重置时间则退避 10 分钟。

@@ -8,6 +8,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { healthFromQuota } from './core.js'
+import { deepseekBalanceAdapter } from './quota/adapters/deepseek-balance.js'
 import { minimaxAdapter } from './quota/adapters/minimax.js'
 import { zhipuAdapter } from './quota/adapters/zhipu.js'
 
@@ -205,4 +206,119 @@ test('zhipu 适配器:用量比例按额度算术得出,用尽即为 100%', asyn
   // 用尽 → 已用 100% → 限流。
   assert.equal(result.windows[0].usedPercent, 100)
   assert.equal(healthFromQuota({ status: 'ok', windows: result.windows }, 'ok', 0, 1_000_000).health, 'limited')
+})
+
+/* ---------------------- DeepSeek 官方余额(/user/balance) ---------------------- */
+
+test('deepseek-balance 适配器:走官方 /user/balance,CNY 优先并带上 is_available', async () => {
+  const body = {
+    is_available: true,
+    balance_infos: [
+      { currency: 'USD', total_balance: '5.00' },
+      { currency: 'CNY', total_balance: '110.00' },
+    ],
+  }
+  const { fetchFn, calls } = stubFetch(body)
+  const result = await deepseekBalanceAdapter.query({
+    provider: 'deepseek-official',
+    apiKey: 'sk-test',
+    fetchFn,
+  })
+  assert.equal(calls[0].url, 'https://api.deepseek.com/user/balance')
+  assert.equal(calls[0].init.headers.authorization, 'Bearer sk-test')
+  // 余额随响应带出,供健康判定采信官方结论。
+  assert.deepEqual(result.windows[0], {
+    tier: 'balance',
+    remainingValue: 110,
+    unit: 'cny',
+    available: true,
+  })
+})
+
+test('deepseek-balance 适配器:baseURL 末尾的 /v1 要剥掉', async () => {
+  const body = { balance_infos: [{ currency: 'CNY', total_balance: '1.00' }] }
+  const { fetchFn, calls } = stubFetch(body)
+  await deepseekBalanceAdapter.query({
+    provider: 'deepseek-official',
+    baseUrl: 'https://api.deepseek.com/v1',
+    apiKey: 'sk-test',
+    fetchFn,
+  })
+  assert.equal(calls[0].url, 'https://api.deepseek.com/user/balance')
+})
+
+test('deepseek-balance 适配器:Messages 根(/anthropic)也要回到平台根', async () => {
+  // DSH 的 deepseek-official 推理根是 https://api.deepseek.com/anthropic;
+  // 显式配置 baseURL 时不能把 /anthropic 带进余额端点,否则会 404。
+  const body = { balance_infos: [{ currency: 'CNY', total_balance: '1.00' }] }
+  const { fetchFn, calls } = stubFetch(body)
+  await deepseekBalanceAdapter.query({
+    provider: 'deepseek-official',
+    baseUrl: 'https://api.deepseek.com/anthropic',
+    apiKey: 'sk-test',
+    fetchFn,
+  })
+  assert.equal(calls[0].url, 'https://api.deepseek.com/user/balance')
+})
+
+test('deepseek-balance 适配器:透支余额保留负号,健康判定为限流', async () => {
+  const body = {
+    is_available: false,
+    balance_infos: [{ currency: 'CNY', total_balance: '-0.01' }],
+  }
+  const { fetchFn } = stubFetch(body)
+  const result = await deepseekBalanceAdapter.query({
+    provider: 'deepseek-official',
+    apiKey: 'sk-test',
+    fetchFn,
+  })
+  // 金额在响应里是字符串;负数是透支的真实形状,不能被截成 0。
+  assert.equal(result.windows[0].remainingValue, -0.01)
+  assert.equal(result.windows[0].available, false)
+  assert.equal(healthFromQuota({ status: 'ok', windows: result.windows }, 'ok', 0, 1_000_000).health, 'limited')
+})
+
+test('deepseek-balance 适配器:没有 CNY 时回退到 USD', async () => {
+  const body = { balance_infos: [{ currency: 'USD', total_balance: '8.50' }] }
+  const { fetchFn } = stubFetch(body)
+  const result = await deepseekBalanceAdapter.query({
+    provider: 'deepseek-official',
+    apiKey: 'sk-test',
+    fetchFn,
+  })
+  assert.deepEqual(result.windows[0], {
+    tier: 'balance',
+    remainingValue: 8.5,
+    unit: 'usd',
+  })
+})
+
+test('deepseek-balance 适配器:响应形状不对时归为 parse 错误', async () => {
+  const malformed = [
+    null,
+    {},
+    { balance_infos: [] },
+    { balance_infos: [{ currency: 'CNY', total_balance: 'abc' }] },
+  ]
+  for (const body of malformed) {
+    const { fetchFn } = stubFetch(body)
+    await assert.rejects(
+      () => deepseekBalanceAdapter.query({
+        provider: 'deepseek-official',
+        apiKey: 'sk-test',
+        fetchFn,
+      }),
+      error => error?.kind === 'parse')
+  }
+})
+
+test('deepseek-balance 适配器:401 归为 auth,健康判定为无效', async () => {
+  const { fetchFn } = stubFetch({}, { status: 401 })
+  await assert.rejects(
+    () => deepseekBalanceAdapter.query({
+      provider: 'deepseek-official',
+      apiKey: 'sk-test',
+      fetchFn,
+    }),
+    error => error?.kind === 'auth')
 })

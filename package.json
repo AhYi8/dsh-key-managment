@@ -1,6 +1,6 @@
 {
   "name": "dsh-key-managment",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "Per-provider API key pool with manual switching for DSH providers",
   "repository": {
