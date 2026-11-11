@@ -255,6 +255,9 @@ export function validateProbeConfig(patch) {
   if (patch.quotaProbe !== undefined && typeof patch.quotaProbe !== 'boolean') {
     return 'quotaProbe 必须是布尔值'
   }
+  if (patch.fallbackOnFailure !== undefined && typeof patch.fallbackOnFailure !== 'boolean') {
+    return 'fallbackOnFailure 必须是布尔值'
+  }
   const intervalError = checkNumberRule('quotaIntervalMs', patch.quotaIntervalMs, PROBE_CONFIG_RULES.quotaIntervalMs)
   if (intervalError !== null) return intervalError
   const gapError = checkNumberRule('quotaProbeGapMs', patch.quotaProbeGapMs, PROBE_CONFIG_RULES.quotaProbeGapMs)
@@ -358,13 +361,13 @@ export function healthFromQuota(payload, prev, prevLevel, now, prevCooldown = 0)
       w.available === false || (typeof w.remainingValue === 'number' && w.remainingValue <= 0)))
     if (overdrawn !== undefined) {
       // 余额没有重置时间,给固定 10 分钟冷却;到下一轮探测会重新判定。
-      return { health: 'limited', cooldownUntil: now + 10 * 60_000, level: 0 }
+      return { health: 'limited', cooldownUntil: now + QUOTA_COOLDOWN_MS, level: 0 }
     }
     const exhausted = windows.filter(w => typeof w.usedPercent === 'number' && w.usedPercent >= 100)
     if (exhausted.length > 0) {
       // 冷却到最早重置的耗尽窗口;缺重置时间则退避 10 分钟。
       const resets = exhausted.map(w => w.resetAt).filter(v => typeof v === 'number' && v > now)
-      const cooldownUntil = resets.length > 0 ? Math.min(...resets) : now + 10 * 60_000
+      const cooldownUntil = resets.length > 0 ? Math.min(...resets) : now + QUOTA_COOLDOWN_MS
       return { health: 'limited', cooldownUntil, level: 0 }
     }
     return { health: 'ok', cooldownUntil: 0, level: 0 }
@@ -422,6 +425,123 @@ export function settleKeyHealth(providers, provider, keyId, payload, now) {
   key.cooldownUntil = verdict.cooldownUntil
   key.cooldownLevel = verdict.level
   return { changed: true, health: verdict.health }
+}
+
+/* ---------------------- 调用失败兜底判定 ---------------------- */
+
+/**
+ * 额度类失败的固定冷却时长。
+ *
+ * 余额窗口耗尽、探测判定的透支、调用兜底判定的欠费共用同一个值:额度是
+ * 账户级状态,短时间内换回来也没意义;但不该像 invalid 那样永久拉黑——
+ * 池内其他密钥可能属于别的账户。冷却到期后 isSelectable 会重新放行。
+ */
+export const QUOTA_COOLDOWN_MS = 10 * 60_000
+
+/**
+ * 额度/欠费类措辞。
+ *
+ * 厂商把「账户欠费」放在完全不同的层级:OpenAI 是 429 + `insufficient_quota`,
+ * 智谱是 429 + 中文「账户已欠费」,DashScope 是 403 + `Arrearage`,
+ * OpenRouter 是 402 + `payment_required`,Anthropic 是 402 + `billing_error`,
+ * Kimi 是 429 + `exceeded_current_quota_error` 且消息形如
+ * "Account balance is insufficient"(词序与英文惯用式相反)。
+ * DSH 归一化后只有部分厂商落到 QUOTA,因此必须按措辞再兜一层。
+ */
+const QUOTA_FAILURE_TEXT = /insufficient[\s_-]?(?:quota|balance|credits?|funds)|exceeded_current_quota|credit[_-]?balance[_-]?exhausted|spend[\s_-]?limit|budget[\s_-]?(?:exceeded|exhausted|limit)|total[\s_-]?budget|key[\s_-]?limit[\s_-]?exceeded|payment[_-]?required|billing_error|arrearage|credit balance is too low|out of credits|(?:quota|balance|credits?)\b[^.]{0,24}(?:insufficient|exhausted|depleted|不足)|余额不足|余额已不足|账户欠费|欠费|额度不足/i
+
+/**
+ * 账户/策略类措辞。
+ *
+ * 出现在 401/403 里说明失败与「这把密钥本身无效」无关:DashScope 欠费给的是
+ * 403 Arrearage,Anthropic 组织策略禁止 CORS 也是 401,OpenAI 的组织成员限制
+ * 同理。把这些当密钥失效去换钥、标 invalid,会把整池密钥一次请求全部拉黑。
+ *
+ * 注意 `disabled` 必须绑定到 account/project/organization:厂商也会用
+ * "API key is disabled" 表达密钥本身被停用,那种情况恰恰应该换钥。
+ */
+const ACCOUNT_FAILURE_TEXT = /arrearage|payment|billing|balance|credit|quota|额度|余额|欠费|organi[sz]ation|cors|spend[\s_-]?limit|account\b[^.]{0,40}(?:disabled|suspended|欠费)/i
+
+/** 服务端瞬时故障:401/403 也可能是网关/认证服务抖动,不能据此判废钥。 */
+const INFRA_FAILURE_TEXT = /service[\s_-]?unavailable|temporarily|try[\s_-]?again|maintenance|overloaded|网关|超时/i
+
+/** 凭据级失败的措辞;命中即密钥本身的问题(覆盖 400/401/403 各种形态)。 */
+const CREDENTIAL_FAILURE_TEXT = /invalid[\s_-]*(?:x-)?api[\s_-]*key|incorrect[\s_-]*(?:x-)?api[\s_-]*key|api[\s_-]*key[^.]{0,16}(?:missing|invalid|incorrect|disabled|revoked|expired|not[\s_-]*valid|缺失|无效|过期|非法)|invalid[_-]*credentials|invalid[_-]*authentication|authentication[\s_-]?fails?|\bauthentication\b|身份验证失败|认证失败|鉴权失败/i
+
+/**
+ * 授权范围类措辞:密钥可能是好的,只是没有访问某个模型/资源的权限。
+ *
+ * Anthropic 的 `permission_error`(无权使用指定模型)是典型例子:换一把钥
+ * 未必有用,更不该把它标成永久 invalid——一次模型权限 403 就能打空整池。
+ */
+const AUTHORIZATION_SCOPE_TEXT = /permission|not[\s_-]?allowed|no[\s_-]?access|does[\s_-]?not[\s_-]?have[\s_-]?access|forbidden|权限/i
+
+/**
+ * 判定一次模型调用失败该不该换钥。
+ *
+ * 顺序很重要:先认额度(欠费可能被厂商塞进 403/AUTH),再用账户/基础设施
+ * 措辞否决,然后认凭据措辞,最后才用 DSH 的归一化码兜底。返回 none 时
+ * 调用方必须原样透传失败,不能吞错。
+ *
+ * @param failure DSH 归一化后的失败事实 `{ message, code, status? }`
+ * @returns {{action: 'invalid'|'quota'|'none', reason: string}}
+ */
+export function classifyStreamFailure(failure) {
+  if (failure === null || typeof failure !== 'object') return { action: 'none', reason: 'empty' }
+  const code = typeof failure.code === 'string' ? failure.code : ''
+  const message = typeof failure.message === 'string' ? failure.message : ''
+  const status = Number.isInteger(failure.status) ? failure.status : undefined
+  if (code === 'QUOTA' || code === 'ACCOUNT_QUOTA' || status === 402 || QUOTA_FAILURE_TEXT.test(message)) {
+    return { action: 'quota', reason: code === 'QUOTA' || code === 'ACCOUNT_QUOTA' || status === 402 ? 'code' : 'wording' }
+  }
+  // 账户/策略级失败:即使带着 401/403 也不能当密钥失效。
+  if (ACCOUNT_FAILURE_TEXT.test(message)) return { action: 'none', reason: 'account' }
+  // 网关/认证服务抖动:短暂失败不该把密钥永久拉黑。
+  if (INFRA_FAILURE_TEXT.test(message)) return { action: 'none', reason: 'infra' }
+  // 凭据措辞:有些厂商把无效密钥报成 400(如 "API key not valid")。
+  if (CREDENTIAL_FAILURE_TEXT.test(message)) return { action: 'invalid', reason: 'wording' }
+  // 权限范围问题:换钥未必有用,更不该标 invalid。
+  if (AUTHORIZATION_SCOPE_TEXT.test(message)) return { action: 'none', reason: 'scope' }
+  // DSH 已归一化为 AUTH/INVALID_CREDENTIAL 的 401/403:厂商可能只回
+  // "401 Unauthorized" 或给独立的 status,不能强求措辞。
+  if (code === 'AUTH' || code === 'INVALID_CREDENTIAL' || status === 401 || status === 403) {
+    return { action: 'invalid', reason: 'code' }
+  }
+  // 防御:码没归类但消息里带 401/403。
+  if (/\b(?:401|403)\b/.test(message)) return { action: 'invalid', reason: 'status' }
+  return { action: 'none', reason: 'other' }
+}
+
+/**
+ * 是「已产出内容」的流块吗。
+ *
+ * 判零内容重试时不能把元数据块算成内容:pi-ai 适配器的失败流固定先发
+ * 一个 `usage` 块再发错误终止块,把它当内容会让兜底对所有 pi-ai 供应商失效。
+ *
+ * @param chunk 尚未送出的流块
+ * @returns 是否代表调用方已经看到了模型输出
+ */
+export function isStreamContentChunk(chunk) {
+  if (chunk === null || typeof chunk !== 'object') return false
+  return chunk.type !== 'usage' && chunk.type !== 'finish'
+}
+
+/**
+ * 是否是「适配器失败」的终止块。
+ *
+ * DSH 不会把适配器异常抛给 llm/stream 监听器,而是转成终止块下发:
+ * `{ type:'finish', reason:{ kind:'error', failure:{...} } }`。
+ * 只有这种块允许触发兜底;正常结束、中断、消费方错误都不行。
+ */
+export function isFallbackFailureChunk(chunk) {
+  return chunk !== null
+    && typeof chunk === 'object'
+    && chunk.type === 'finish'
+    && chunk.reason !== null
+    && typeof chunk.reason === 'object'
+    && chunk.reason.kind === 'error'
+    && chunk.reason.failure !== null
+    && typeof chunk.reason.failure === 'object'
 }
 
 /**

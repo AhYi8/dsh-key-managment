@@ -54,6 +54,8 @@ async function withTempProfile(fn) {
 function mockCtx(disposers) {
   const credentials = new Map()
   const warnings = []
+  /** llm/stream 的处理器:测试里手动触发瀑布的第二段。 */
+  const handlers = new Map()
   const ctx = {
     credentials: {
       async resolve(ref) {
@@ -78,11 +80,22 @@ function mockCtx(disposers) {
     inject(names, callback) {
       return callback({ settings: ctx.settings, configEditor: undefined })
     },
-    /** on:插件用它挂 llm/stream 瀑布监听器,测试里不真正执行。 */
-    on() { return () => { /* 卸载清理 */ } },
-    warn(message) { warnings.push(message) },
+    /** on:捕获 llm/stream 处理器,供兜底用例手动驱动瀑布。 */
+    on(event, handler) {
+      handlers.set(event, handler)
+      return () => { handlers.delete(event) }
+    },
+    /** 宿主内置日志器:插件必须走 ctx.logger,不能直接取 ctx.warn。 */
+    logger: {
+      warn(message) { warnings.push(message) },
+    },
   }
-  return { ctx, credentials, warnings }
+  // 复刻宿主真实行为:读取未声明的 ctx 属性会直接抛错。
+  // 保留这个陷阱,防止再写出 ctx.warn?.(...) 这类"可选链挡不住 getter"的代码。
+  Object.defineProperty(ctx, 'warn', {
+    get() { throw new Error('cannot get property "warn" without inject') },
+  })
+  return { ctx, credentials, warnings, handlers }
 }
 
 /**
@@ -90,14 +103,14 @@ function mockCtx(disposers) {
  * 插件把 HTTP 路由注册在 ctx.webServer.register 上,这里捕获其 handler,
  * 再用模拟的 req/res 把 JSON 动作喂进去。
  */
-function apiOf(ctx, disposers) {
+function apiOf(ctx, disposers, config = {}) {
   let handler
   const original = ctx.webServer.register
   ctx.webServer.register = (entry) => { handler = entry.handler }
   // quotaProbe:false —— 后台探测不跑,免得测试真的去请求厂商接口。
   // 测试跑在 node --test --test-force-exit 下:插件的后台探测用 setTimeout
   // 轮转,它的清理函数只置停止标志、不取消挂起的定时器,进程会多等一个轮间隔。
-  apply(ctx, { quotaProbe: false, quotaIntervalMs: 3_600_000, quotaProbeGapMs: 200 })
+  apply(ctx, { quotaProbe: false, quotaIntervalMs: 3_600_000, quotaProbeGapMs: 200, ...config })
   ctx.webServer.register = original
 
   return async (body) => {
@@ -213,5 +226,309 @@ test('index.js:测试不会写进真实 profile 目录', async () => {
   await withTempProfile(async (dir, disposers) => {
     assert.equal(process.env.DSH_PROFILE_DIR, dir)
     assert.notEqual(dir, realProfile)
+  })
+})
+
+/* ---------------------- 调用失败自动换钥兜底 ---------------------- */
+
+/** 把一串块包成上游迭代器;每次调用模拟一次新的模型请求。 */
+function streamOf(chunks) {
+  return (async function* () {
+    for (const chunk of chunks) yield chunk
+  })()
+}
+
+/** 构造 DSH 的终止失败块(适配器失败不会被抛出,而是以块下发)。 */
+function failureChunk(failure) {
+  return { type: 'finish', reason: { kind: 'error', failure } }
+}
+
+/** 建一个两把密钥的池子,并把常用句柄交给用例。 */
+async function withTwoKeys(fn, config) {
+  await withTempProfile(async (dir, disposers) => {
+    const { ctx, credentials, warnings, handlers } = mockCtx(disposers)
+    withAdoptableProvider(ctx, credentials)
+    const api = apiOf(ctx, disposers, config)
+    await api({ action: 'adoptProvider', provider: 'minimax-cn' })
+    const added = await api({ action: 'addKey', provider: 'minimax-cn', value: 'sk-second' })
+    const first = added.providers[0].keys.find(key => key.alias === 'Key_1')
+    await fn({ api, credentials, warnings, handlers, first, dir })
+  })
+}
+
+/** 跑一次 llm/stream 观察者,返回下游看到的块。 */
+async function observe(listener, provider, signal, chunks) {
+  const seen = []
+  for await (const chunk of listener({ provider, signal }, () => streamOf(chunks))) seen.push(chunk)
+  return seen
+}
+
+/** 恢复点的 next 用哨兵值证明「没有拦下这次失败」。 */
+const NEXT = Symbol('next')
+async function recoverAt(handler, payload) {
+  let nextCalled = 0
+  const action = await handler(payload, () => {
+    nextCalled += 1
+    return Promise.resolve(NEXT)
+  })
+  return { action, nextCalled }
+}
+
+test('index.js:密钥失效在恢复点换钥并要求重试', async () => {
+  await withTwoKeys(async ({ api, credentials, warnings, handlers, first }) => {
+    const signal = { aborted: false }
+    const failure = { code: 'AUTH', message: '401: {"error":{"message":"Incorrect API key provided"}}' }
+    // ① llm/stream 只观察:失败块原样透传(cordis 的 next() 单次守卫不允许在这里重放)。
+    const seen = await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    assert.deepEqual(seen, [failureChunk(failure)])
+    // ② 恢复点:换钥并回答 retry,agent loop 会用新凭据重新 prepareRequest 再派发。
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal, turn: 1, step: 0 })
+    assert.deepEqual(action, { kind: 'retry' })
+    assert.equal(nextCalled, 0)
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-second')
+    // ③ 兜底必须留痕(走 ctx.logger;历史上这里误用 ctx.warn 把整个 turn 打断了)。
+    assert.equal(warnings.some(line => line.includes('已自动换到下一把密钥')), true)
+    const state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].keys.find(key => key.id === first.id).health, 'invalid')
+  })
+})
+
+test('index.js:额度/欠费失败标 limited 并冷却,不拉黑密钥', async () => {
+  await withTwoKeys(async ({ api, credentials, handlers, first }) => {
+    const signal = { aborted: false }
+    // DashScope 欠费在 DSH 里被归一化成 AUTH:这里验证兜底不会误标 invalid。
+    const failure = { code: 'AUTH', message: '403: {"code":"Arrearage","message":"Access denied"}' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const { action } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.deepEqual(action, { kind: 'retry' })
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-second')
+    const state = await api({ action: 'getState' })
+    const failed = state.providers[0].keys.find(key => key.id === first.id)
+    assert.equal(failed.health, 'limited')
+    assert.equal(failed.limited, true)
+    assert.ok(failed.cooldownUntil > Date.now())
+  })
+})
+
+test('index.js:已经产出内容后失败不重试', async () => {
+  await withTwoKeys(async ({ credentials, handlers }) => {
+    const signal = { aborted: false }
+    const failure = { code: 'AUTH', message: '401 Incorrect API key' }
+    const seen = await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [
+      { type: 'text-delta', index: 0, text: 'partial' },
+      failureChunk(failure),
+    ])
+    assert.deepEqual(seen.map(chunk => chunk.type), ['text-delta', 'finish'])
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    // 重发会让调用方看到重复文本,所以放行原失败。
+    assert.equal(action, NEXT)
+    assert.equal(nextCalled, 1)
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-original')
+  })
+})
+
+test('index.js:池内没有可换的密钥时放行原失败', async () => {
+  await withTempProfile(async (dir, disposers) => {
+    const { ctx, credentials, handlers } = mockCtx(disposers)
+    withAdoptableProvider(ctx, credentials)
+    const api = apiOf(ctx, disposers)
+    await api({ action: 'adoptProvider', provider: 'minimax-cn' })
+    const signal = { aborted: false }
+    const failure = { code: 'AUTH', message: '401 Incorrect API key' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.equal(action, NEXT)
+    assert.equal(nextCalled, 1)
+    const state = await api({ action: 'getState' })
+    // 单钥池:标记之后确实没有可选钥,不能虚空轮换。
+    assert.equal(state.providers[0].keys[0].health, 'invalid')
+  })
+})
+
+test('index.js:关闭兜底后不重试、不改健康状态', async () => {
+  await withTwoKeys(async ({ api, credentials, handlers }) => {
+    const signal = { aborted: false }
+    const failure = { code: 'AUTH', message: '401 Incorrect API key' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.equal(action, NEXT)
+    assert.equal(nextCalled, 1)
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-original')
+    const state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].keys.every(key => key.health !== 'invalid'), true)
+  }, { fallbackOnFailure: false })
+})
+
+test('index.js:调用已中断时不重试', async () => {
+  await withTwoKeys(async ({ credentials, handlers }) => {
+    const signal = { aborted: true }
+    const failure = { code: 'AUTH', message: '401 Incorrect API key' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const { action } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.equal(action, NEXT)
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-original')
+  })
+})
+
+test('index.js:兜底重发不重复计入调用次数', async () => {
+  await withTwoKeys(async ({ api, handlers }) => {
+    const listener = handlers.get('llm/stream')
+    const signal = { aborted: false }
+    const success = [{ type: 'finish', reason: { kind: 'stop' } }]
+    await observe(listener, 'minimax-cn', signal, success)
+    let state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].requestCount, 1)
+    // 失败一次(计数 +1),恢复点换钥会把计数清零。
+    const failure = { code: 'AUTH', message: '401 Incorrect API key' }
+    await observe(listener, 'minimax-cn', signal, [failureChunk(failure)])
+    const { action } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.deepEqual(action, { kind: 'retry' })
+    state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].requestCount, 0)
+    // 同一 signal 上的兜底重发不再计数。
+    await observe(listener, 'minimax-cn', signal, success)
+    state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].requestCount, 0)
+    // 同一 signal 上的下一次普通请求恢复计数。
+    await observe(listener, 'minimax-cn', signal, success)
+    state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].requestCount, 1)
+  })
+})
+
+test('index.js:外部改过生效密钥时不做兜底', async () => {
+  // 请求途中用户可能在设置页把密钥改了:这时 activeKeyId 与实际在用的值对不上,
+  // 按 activeKeyId 标记会把失败记到没参与请求的密钥头上,只能放弃兜底。
+  await withTwoKeys(async ({ credentials, handlers, first, api }) => {
+    credentials.set('MINIMAX_CN_API_KEY', 'sk-typed-by-user')
+    const signal = { aborted: false }
+    const failure = { code: 'AUTH', message: '401 Incorrect API key' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.equal(action, NEXT)
+    assert.equal(nextCalled, 1)
+    const state = await api({ action: 'getState' })
+    const failed = state.providers[0].keys.find(key => key.id === first.id)
+    // 没有证据表明是这把钥失效,不能动它的健康状态。
+    assert.equal(failed.health, 'unknown')
+  })
+})
+
+test('index.js:未纳管的供应商不参与兜底', async () => {
+  await withTwoKeys(async ({ handlers }) => {
+    const signal = { aborted: false }
+    const seen = await observe(handlers.get('llm/stream'), 'not-managed', signal,
+      [failureChunk({ code: 'AUTH', message: '401 Incorrect API key' })])
+    assert.equal(seen.length, 1)
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'not-managed', failure: { code: 'AUTH' }, signal })
+    assert.equal(action, NEXT)
+    assert.equal(nextCalled, 1)
+  })
+})
+
+test('index.js:恢复点没有对应请求快照时直接放行', async () => {
+  await withTwoKeys(async ({ handlers }) => {
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure: { code: 'AUTH' }, signal: { aborted: false } })
+    assert.equal(action, NEXT)
+    assert.equal(nextCalled, 1)
+  })
+})
+
+test('index.js:pi-ai 的 usage 元数据块不影响兜底判定', async () => {
+  // 回归护栏:pi-ai 适配器在 error 事件时固定先发 usage 再发失败 finish。
+  // 曾经把 usage 当"已产出内容",导致除 DeepSeek 官方外的供应商兜底永不触发。
+  await withTwoKeys(async ({ api, credentials, handlers, first }) => {
+    const signal = { aborted: false }
+    const failure = { code: 'AUTH', message: '401: {"error":{"message":"Incorrect API key provided"}}' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [
+      { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } },
+      failureChunk(failure),
+    ])
+    const { action } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.deepEqual(action, { kind: 'retry' })
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-second')
+    const state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].keys.find(key => key.id === first.id).health, 'invalid')
+  })
+})
+
+test('index.js:403 权限类失败不换钥也不拉黑密钥', async () => {
+  // Anthropic 的 permission_error 表示"这把钥无权使用该模型",与钥是否有效无关。
+  // 曾经会把它判成 invalid,一次权限 403 就能逐把打空整池。
+  await withTwoKeys(async ({ api, credentials, handlers, first }) => {
+    const signal = { aborted: false }
+    const failure = {
+      code: 'AUTH',
+      message: '403: {"type":"error","error":{"type":"permission_error","message":"Your API key does not have permission to use the specified model"}}',
+    }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const { action, nextCalled } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.equal(action, NEXT)
+    assert.equal(nextCalled, 1)
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-original')
+    const state = await api({ action: 'getState' })
+    assert.equal(state.providers[0].keys.find(key => key.id === first.id).health, 'unknown')
+  })
+})
+
+test('index.js:同一 turn 的额度失败只换一次钥', async () => {
+  // 额度是账户级状态:同 turn 连续两把都欠费时,继续逐把试只是放大请求量。
+  // 用三把钥,才能把「按 turn 收敛」与「池子恰好耗尽」区分开。
+  await withTwoKeys(async ({ api, credentials, handlers }) => {
+    await api({ action: 'addKey', provider: 'minimax-cn', value: 'sk-third' })
+    const signal = { aborted: false }
+    const failure = { code: 'QUOTA', message: '402: Insufficient Balance' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const firstAttempt = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.deepEqual(firstAttempt.action, { kind: 'retry' })
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-second')
+    // 重发又因欠费失败:这次应按 turn 上限放行,不再换第三把。
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [
+      { type: 'usage', usage: {} },
+      failureChunk(failure),
+    ])
+    const secondAttempt = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.equal(secondAttempt.action, NEXT)
+    assert.equal(secondAttempt.nextCalled, 1)
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-second')
+    const state = await api({ action: 'getState' })
+    const third = state.providers[0].keys.find(key => key.alias === 'Key_3')
+    assert.equal(third.health, 'unknown')
+  })
+})
+
+test('index.js:并发请求撞同一把密钥只换一次', async () => {
+  await withTwoKeys(async ({ api, credentials, handlers, first }) => {
+    const failure = { code: 'AUTH', message: '401 Incorrect API key' }
+    const signalA = { aborted: false }
+    const signalB = { aborted: false }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signalA, [failureChunk(failure)])
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signalB, [failureChunk(failure)])
+    const [a, b] = await Promise.all([
+      recoverAt(handlers.get('agent/request-error'), { provider: 'minimax-cn', failure, signal: signalA }),
+      recoverAt(handlers.get('agent/request-error'), { provider: 'minimax-cn', failure, signal: signalB }),
+    ])
+    // 两个请求都允许重发,但池子只往前走了把,没有连跳两把。
+    assert.deepEqual(a.action, { kind: 'retry' })
+    assert.deepEqual(b.action, { kind: 'retry' })
+    assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-second')
+    const state = await api({ action: 'getState' })
+    const keys = state.providers[0].keys
+    assert.equal(keys.find(key => key.id === first.id).health, 'invalid')
+    assert.equal(keys.find(key => key.id !== first.id).health, 'unknown')
   })
 })

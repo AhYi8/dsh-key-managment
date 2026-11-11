@@ -10,7 +10,8 @@
  *   与设置页(模型页密钥字段)保存走同一条凭据通道;
  * - 通过 webServer 的同源 HTTP 路由向 Web 客户端暴露 JSON API。
  *
- * 只做手动轮换:没有自动故障转移、重试或冷却策略(需求裁剪)。
+ * 轮换:支持手动切换、按调用次数/定时自动轮换,以及调用失败时的换钥兜底
+ * (零内容阶段识别密钥级/额度级失败后切到下一把可选密钥并重放)。
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
@@ -18,9 +19,13 @@ import { dirname, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { probeKey } from './quota-bridge.js'
 import {
+  classifyStreamFailure,
   hitValue,
+  isFallbackFailureChunk,
   isSelectable,
+  isStreamContentChunk,
   MAX_KEYS_PER_PROVIDER,
+  QUOTA_COOLDOWN_MS,
   digestOf,
   findKeyByDigest,
   mergeRuntimeState,
@@ -55,10 +60,21 @@ export const Config = z.object({
   quotaIntervalMs: z.number().step(60_000).min(60_000).max(86_400_000).default(1_800_000).volatile(),
   /** 一轮内相邻两次厂商调用之间的间隔(毫秒),默认 5 秒,限流友好。 */
   quotaProbeGapMs: z.number().step(100).min(200).max(60_000).default(5_000).volatile(),
+  /** 调用遇密钥失效或额度不足时自动换钥重发(兜底),默认开启。 */
+  fallbackOnFailure: z.boolean().default(true).volatile(),
 })
 
 /** 同源 API 路由路径;客户端用同一常量访问。 */
 export const API_PATH = '/dsh-key-managment/api'
+
+/**
+ * 同一 turn 内「额度/欠费」失败重复换钥的次数上限。
+ *
+ * 额度是账户级状态:池内密钥往往同属一个账户,继续逐把试只会把一次用户请求
+ * 放大成几十次失败请求与写盘。密钥级失败不设这个上限——每把确实是坏钥,
+ * 跳过它才是正确行为(按用户要求"试到耗尽")。
+ */
+const QUOTA_FALLBACK_MAX_PER_TURN = 1
 
 /**
  * 状态文件位置:跟随 profile 目录(与生态内其他插件一致),
@@ -144,7 +160,7 @@ export function apply(ctx, config) {
     }
   })()
   ready.catch((error) => {
-    ctx.warn?.(`初始化失败: ${error?.message ?? error}`)
+    ctx.logger.warn(`初始化失败: ${error?.message ?? error}`)
   })
 
   /**
@@ -167,7 +183,7 @@ export function apply(ctx, config) {
   // 兜底:settings 迟到或扫描卡死时,超时后照样开跑。
   // 否则后台探测会静默停摆——宁可用目录默认端点探一轮,也不要完全不探。
   startupTimer = setTimeout(() => {
-    ctx.warn?.('后台探测启动闸门超时:未等到 settings 就绪,先按目录默认端点探一轮')
+    ctx.logger.warn('后台探测启动闸门超时:未等到 settings 就绪,先按目录默认端点探一轮')
     releaseStartup()
   }, 30_000)
 
@@ -189,7 +205,7 @@ export function apply(ctx, config) {
       try {
         await ensureScanned()
       } catch (error) {
-        ctx.warn?.(`扫描失败(可在界面手动刷新): ${error?.message ?? error}`)
+        ctx.logger.warn(`扫描失败(可在界面手动刷新): ${error?.message ?? error}`)
       } finally {
         // 扫描尝试结束(成功或失败):放行后台探测的启动首轮。
         releaseStartup()
@@ -317,7 +333,7 @@ export function apply(ctx, config) {
         await writeFile(tempPath, JSON.stringify(Object.fromEntries(quotaStore), null, 2), 'utf8')
         await renameWithRetry(tempPath, quotaPath)
       } catch (error) {
-        ctx.warn?.(`余额快照落盘失败: ${error?.message ?? error}`)
+        ctx.logger.warn(`余额快照落盘失败: ${error?.message ?? error}`)
       }
     })
     return quotaTail
@@ -378,7 +394,7 @@ export function apply(ctx, config) {
       await persistQuota()
       if (stateDirty) await persist()
     } catch (error) {
-      ctx.warn?.(`后台余额探测失败: ${error?.message ?? error}`)
+      ctx.logger.warn(`后台余额探测失败: ${error?.message ?? error}`)
     } finally {
       backgroundProbing = false
     }
@@ -509,11 +525,14 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 自动轮换到下一把可选密钥:无效/冷却中的限流密钥自动跳过。
-   * 候选状态为"未知"时先探测一次落定健康状态再决定用不用;
-   * 选中后推进游标,保证整池循环而不是在两把之间打转。
+   * 轮换的实际实现(不加锁)。
+   *
+   * 只给已经持锁的调用方用(兜底路径),其余入口一律走下面的
+   * `rotateToNext`——否则按次数/定时/手动与兜底会交错推进游标,
+   * 一次故障白跳两把密钥。
    */
-  async function rotateToNext(provider) {
+  async function rotateToNextUnlocked(provider, options = {}) {
+    const probeUnknown = options.probeUnknown !== false
     const total = requireRecord(provider).keys.length
     for (let attempt = 0; attempt < total; attempt += 1) {
       // 每轮重新取活记录:探测期间的 await 可能让 60 秒定时同步整体替换
@@ -528,7 +547,7 @@ export function apply(ctx, config) {
       // 未知与否也读活对象:手里这份 record 可能已是孤儿,它上面的
       // health 停留在上一次同步前的旧值。
       const candidate = liveKeyOf(provider, nextId) ?? key
-      if ((candidate.health ?? 'unknown') === 'unknown') {
+      if (probeUnknown && (candidate.health ?? 'unknown') === 'unknown') {
         const payload = await probeKey(ctx, record, key, profileOf(provider), quotaStore, quotaInflight, true)
         // 按 id 写回活对象:探测期间定时同步可能已替换 state.providers。
         settleKeyHealth(state.providers, provider, key.id, payload, Date.now())
@@ -549,7 +568,7 @@ export function apply(ctx, config) {
       } catch (error) {
         // 选中密钥的值不可读(ref 被外部删除等):标记无效并尝试下一把,
         // 不能让单个坏候选中断整池轮换(审查 P1-6)。
-        ctx.warn?.(`轮换选中 ${key.alias} 失败,标记无效并跳过: ${error?.message ?? error}`)
+        ctx.logger.warn(`轮换选中 ${key.alias} 失败,标记无效并跳过: ${error?.message ?? error}`)
         // 同样写活对象:孤儿上的标记会随落盘丢失,坏密钥将永远保持可用。
         const target = liveKeyOf(provider, nextId) ?? key
         target.health = 'invalid'
@@ -561,9 +580,139 @@ export function apply(ctx, config) {
         await persist()
       }
     }
-    ctx.warn?.(`${provider} 池内没有可轮换的密钥(全部无效或限流冷却中)`)
+    ctx.logger.warn(`${provider} 池内没有可轮换的密钥(全部无效或限流冷却中)`)
     await persist()
     return false
+  }
+
+  /**
+   * 自动轮换到下一把可选密钥:无效/冷却中的限流密钥自动跳过。
+   * 候选状态为"未知"时先探测一次落定健康状态再决定用不用;
+   * 选中后推进游标,保证整池循环而不是在两把之间打转。
+   *
+   * 所有触发入口共用同一把切换锁:按次数、定时、手动与失败兜底并发时
+   * 只允许一次轮换,否则会一次故障连跳多把。
+   *
+   * @param options.probeUnknown 未知候选是否先探测。真正的用户请求路径
+   *   (调用失败兜底)必须传 false:那里多打一次探测请求会直接拖慢用户请求,
+   *   而失败本身已经证明了候选需要换。
+   */
+  function rotateToNext(provider, options = {}) {
+    return withSwitchLock(provider, () => rotateToNextUnlocked(provider, options))
+  }
+
+  /**
+   * 每个供应商一把切换锁:并发请求同时撞上同一把失效密钥时,只允许一次轮换。
+   *
+   * 没有它的话,N 个并发请求会各自读到同一个 activeKeyId,依次把游标推 N 次,
+   * 一次故障能白跳掉 N 把可用密钥。
+   */
+  const switchLocks = new Map()
+  function withSwitchLock(provider, task) {
+    const previous = switchLocks.get(provider) ?? Promise.resolve()
+    // 前一次失败也要继续排:锁链不能因一次异常永久拒绝后续请求。
+    const run = previous.then(task, task)
+    switchLocks.set(provider, run.then(() => {}, () => {}))
+    return run
+  }
+
+  /**
+   * 每次请求的失败归因快照,按 AbortSignal 关联。
+   *
+   * llm/stream 与 agent/request-error 是两段不同的瀑布,payload 里都没有请求 id;
+   * agent loop 把同一个 phase signal 同时放进请求对象和 request-error 事件,
+   * 因此可以用 signal 的对象身份把"这次失败用的是哪把密钥、是否零内容"带到
+   * 恢复点。键是 signal,恢复点消费时显式 delete,未消费的条目随 signal
+   * 被回收,不需要额外清理。
+   */
+  const pendingFailures = new WeakMap()
+
+  /**
+   * 下一次出站是「兜底触发的重发」的标记(按 signal)。
+   * 按调用次数轮换只该数用户的请求,不把兜底重发也算一次;
+   * DSH 自己的重试(429 等)不经过这里,仍按原有口径计数。
+   */
+  const recoveryRetries = new WeakSet()
+
+  /** 同一 turn 内因额度失败换钥的次数,用于按 turn 收敛放大。 */
+  const quotaFallbacks = new WeakMap()
+
+  /** 取请求的取消信号;不是对象就拿不到关联键。 */
+  function signalKeyOf(options) {
+    const signal = options?.signal
+    return signal !== null && typeof signal === 'object' ? signal : undefined
+  }
+
+  /**
+   * 失败处理前确认「这把密钥确实是本次请求用的那把」。
+   *
+   * - 生效钥已被换走:并发请求可能已经处理过同一把,直接允许重发;
+   * - 仍是生效钥:用原引用当前值的摘要对齐,防止用户中途在设置页改过密钥,
+   *   把失败记到没参与本次请求的那把头上。
+   *
+   * @returns 'serving'(该处理这把) | 'handled'(已被别人处理) | 'stale'(无法归因)
+   */
+  async function fallbackTarget(provider, keyId) {
+    const record = recordOf(provider)
+    if (record === undefined) return 'stale'
+    const key = liveKeyOf(provider, keyId)
+    if (record.activeKeyId !== keyId) {
+      const handled = key !== undefined && (key.health === 'invalid'
+        || (key.health === 'limited' && Number(key.cooldownUntil) > Date.now()))
+      return handled ? 'handled' : 'stale'
+    }
+    if (key === undefined) return 'stale'
+    const current = hitValue(await safeResolve(record.keyRef))
+    const poolValue = hitValue(await safeResolve(key.ref))
+    if (current === undefined || poolValue === undefined) return 'stale'
+    return digestOf(current) === digestOf(poolValue) ? 'serving' : 'stale'
+  }
+
+  /**
+   * 把一次调用失败落成健康状态(写活对象,由调用方统一落盘)。
+   *
+   * - 密钥级(invalid):仅当值确实不可用,后续轮换与候选筛选立即跳过;
+   * - 额度级(quota):账户欠费的密钥换到别的账户仍可能成功,永久拉黑会误伤
+   *   整池,因此只标 limited 并给固定冷却,到期后探测会重新判定。
+   */
+  function settleFallbackVerdict(provider, keyId, action) {
+    const key = liveKeyOf(provider, keyId)
+    if (key === undefined) return false
+    if (action === 'invalid') {
+      key.health = 'invalid'
+      key.cooldownUntil = 0
+      key.cooldownLevel = 0
+    } else {
+      key.health = 'limited'
+      key.cooldownUntil = Date.now() + QUOTA_COOLDOWN_MS
+      key.cooldownLevel = 0
+    }
+    return true
+  }
+
+  /**
+   * 处理一次「零内容阶段的失败」:标记这把密钥、切到下一把可选密钥。
+   *
+   * 只负责状态与凭据切换;真正的"重发请求"由调用方(agent loop 的
+   * request-error 恢复点)用新凭据重新出站,因为 llm/stream 的 `next()`
+   * 有单次调用守卫,不能自己重放。
+   *
+   * @returns 会话是否已经换到别的密钥(调用方才允许返回 retry)。
+   */
+  async function rotateForFailure(provider, keyId, action) {
+    if (disposed) return false
+    return withSwitchLock(provider, async () => {
+      const target = await fallbackTarget(provider, keyId)
+      if (target === 'stale') return false
+      if (target === 'handled') return true
+      if (!settleFallbackVerdict(provider, keyId, action)) return false
+      await persist()
+      // 等锁期间别的请求可能已经把生效钥换走了:这次只需重发,别再跳一把。
+      if (recordOf(provider)?.activeKeyId !== keyId) return true
+      // 请求路径上不探测未知候选:失败已经说明要换,探测只会加延迟。
+      // 这里已经在锁内,必须调不加锁的版本,否则自己把自己锁死。
+      return rotateToNextUnlocked(provider, { probeUnknown: false })
+    })
   }
 
   /** 设置供应商的自动轮换配置。 */
@@ -795,6 +944,7 @@ export function apply(ctx, config) {
       quotaProbe: live(config, 'quotaProbe', true),
       quotaIntervalMs: live(config, 'quotaIntervalMs', 1_800_000),
       quotaProbeGapMs: live(config, 'quotaProbeGapMs', 5_000),
+      fallbackOnFailure: live(config, 'fallbackOnFailure', true),
     }
   }
 
@@ -910,6 +1060,7 @@ export function apply(ctx, config) {
           ...(body.quotaProbe !== undefined ? { quotaProbe: body.quotaProbe } : {}),
           ...(body.quotaIntervalMs !== undefined ? { quotaIntervalMs: body.quotaIntervalMs } : {}),
           ...(body.quotaProbeGapMs !== undefined ? { quotaProbeGapMs: body.quotaProbeGapMs } : {}),
+          ...(body.fallbackOnFailure !== undefined ? { fallbackOnFailure: body.fallbackOnFailure } : {}),
         })
       default:
         throw new Error(`未知动作: ${action}`)
@@ -919,55 +1070,120 @@ export function apply(ctx, config) {
   // 首次扫描不在 ready 里做:settings 注入可能晚于启动,
   // 扫描统一由 settings 就绪后的补扫与 API 调用前的 ensureScanned 触发。
 
-  // 请求归因:llm/stream 瀑布里按供应商计数;按调用次数的自动轮换在这里触发。
-  // 注意:该瀑布不 await 监听器返回值——监听器必须同步返回 AsyncIterable,
-  // 返回 Promise 会导致 "upstream is not async iterable"。
+  // 请求归因 + 失败观察:llm/stream 瀑布里按供应商计数、触发按次数轮换,
+  // 并把「这次请求用了哪把密钥、失败是否发生在零内容阶段」记在 signal 上,
+  // 供 agent/request-error 决定要不要换钥重发。
+  //
+  // 注意两点:
+  // 1) 该瀑布不 await 监听器返回值——监听器必须同步返回 AsyncIterable;
+  // 2) cordis 的 waterfall 给每个监听器的 next() 有单次调用守卫
+  //    ("next() called multiple times"),所以这里绝不能自己重放请求。
   ctx.effect(() => ctx.on('llm/stream', (options, next) => {
+    const providerId = typeof options?.provider === 'string' ? options.provider : undefined
     let rotationProvider = undefined
     try {
-      const providerId = options?.provider
-      const record = typeof providerId === 'string' ? recordOf(providerId) : undefined
+      const record = providerId === undefined ? undefined : recordOf(providerId)
       if (record !== undefined) {
         // 只统计被本插件管理的池;计数先加,再判断是否触发按次数轮换。
-        record.requestCount = (record.requestCount ?? 0) + 1
-        const rotation = normalizeRotation(record.rotation)
-        if (shouldRotateCalls(rotation, record.requestCount)) {
-          rotationProvider = providerId
+        // 兜底触发的重发不重复计数(见 recoveryRetries)。
+        const signal = signalKeyOf(options)
+        if (signal !== undefined && recoveryRetries.has(signal)) {
+          recoveryRetries.delete(signal)
+        } else {
+          record.requestCount = (record.requestCount ?? 0) + 1
+          const rotation = normalizeRotation(record.rotation)
+          if (shouldRotateCalls(rotation, record.requestCount)) {
+            rotationProvider = providerId
+          }
         }
       }
     } catch (error) {
       // 归因失败不阻断请求本身。
-      ctx.warn?.(`请求计数失败: ${error?.message ?? error}`)
+      ctx.logger.warn(`请求计数失败: ${error?.message ?? error}`)
     }
-    if (rotationProvider === undefined) return next()
-    // 触发按次数轮换:上游迭代器先取好,包装成 async generator——
-    // 在产出第一个块之前完成密钥切换(credentials.set),再透传上游。
-    const upstream = next()
+    // 未纳管:完全透传,零额外开销(也不套生成器)。
+    if (providerId === undefined || recordOf(providerId) === undefined) return next()
     return (async function* () {
-      try {
-        // 内存配置可能是陈旧实例残留(界面已改"关闭"但这里没跟上):
-        // 触发阈值时以磁盘为准复核,不符则纠正内存并放弃轮换。
-        const disk = normalizeState(await readStateFile(statePath))
-        const diskRecord = disk.providers[rotationProvider]
-        const diskRotation = normalizeRotation(diskRecord?.rotation)
-        const record = recordOf(rotationProvider)
-        if (record !== undefined && diskRecord !== undefined) {
-          if (diskRotation.mode !== normalizeRotation(record.rotation).mode) {
-            record.rotation = diskRotation
-            record.requestCount = 0
+      if (rotationProvider !== undefined) {
+        try {
+          // 内存配置可能是陈旧实例残留(界面已改"关闭"但这里没跟上):
+          // 触发阈值时以磁盘为准复核,不符则纠正内存并放弃轮换。
+          const disk = normalizeState(await readStateFile(statePath))
+          const diskRecord = disk.providers[rotationProvider]
+          const diskRotation = normalizeRotation(diskRecord?.rotation)
+          const record = recordOf(rotationProvider)
+          if (record !== undefined && diskRecord !== undefined) {
+            if (diskRotation.mode !== normalizeRotation(record.rotation).mode) {
+              record.rotation = diskRotation
+              record.requestCount = 0
+            }
           }
+          if (diskRotation.mode === 'calls' && shouldRotateCalls(diskRotation, (record?.requestCount ?? 0))) {
+            await rotateToNext(rotationProvider)
+          }
+        } catch (error) {
+          ctx.logger.warn(`按次数自动轮换失败: ${error?.message ?? error}`)
         }
-        if (diskRotation.mode === 'calls' && shouldRotateCalls(diskRotation, (record?.requestCount ?? 0))) {
-          await rotateToNext(rotationProvider)
-        }
-      } catch (error) {
-        ctx.warn?.(`按次数自动轮换失败: ${error?.message ?? error}`)
       }
-      for await (const chunk of upstream) {
+      // 归因快照只记「请求开始时生效的是哪把」:不在热路径上解析凭据,
+      // 真正的归属由恢复点在失败时用摘要复核(见 fallbackTarget)。
+      const signal = signalKeyOf(options)
+      const keyId = recordOf(providerId)?.activeKeyId
+      const pending = signal !== undefined && keyId !== null && typeof keyId === 'string'
+        ? { provider: providerId, keyId, zeroContent: true, failure: undefined }
+        : undefined
+      if (pending !== undefined) pendingFailures.set(signal, pending)
+      for await (const chunk of next()) {
+        if (pending !== undefined) {
+          // 只有真正的输出块才算「已产出内容」:pi-ai 的失败流固定先发一个
+          // usage 元数据块再发错误终止块,把 usage 当内容会让兜底永不触发。
+          if (isFallbackFailureChunk(chunk)) pending.failure = chunk.reason?.failure
+          else if (isStreamContentChunk(chunk)) pending.zeroContent = false
+        }
         yield chunk
       }
     })()
-  }), 'dsh-key-managment: llm/stream 请求计数')
+  }), 'dsh-key-managment: llm/stream 请求计数与失败观察')
+
+  // 请求恢复点:agent loop 在模型调用失败后询问是否重试。这里换钥并回答
+  // 「重试」,循环会用新凭据重新 prepareRequest 并重新派发(凭据在出站时解析)。
+  // 只处理零内容阶段、可归因到具体密钥的认证/额度失败;其余交给下一个监听器。
+  ctx.effect(() => ctx.on('agent/request-error', (payload, next) => {
+    const signal = payload?.signal
+    if (signal === null || typeof signal !== 'object') return next()
+    const pending = pendingFailures.get(signal)
+    if (pending === undefined) return next()
+    // 一次失败只处理一次:先摘掉快照,再判断要不要兜底。
+    pendingFailures.delete(signal)
+    if (pending.provider !== payload?.provider) return next()
+    if (live(config, 'fallbackOnFailure', true) !== true) return next()
+    // 失败事实以宿主下发的为准(块里的只是快照的备份)。
+    const failure = payload?.failure ?? pending.failure
+    if (failure === undefined || pending.zeroContent !== true) return next()
+    if (signal.aborted === true) return next()
+    const verdict = classifyStreamFailure(failure)
+    if (verdict.action === 'none') return next()
+    if (verdict.action === 'quota') {
+      // 账户级额度问题不逐把试:同 turn 超过上限就放行原失败。
+      const used = quotaFallbacks.get(signal) ?? 0
+      if (used >= QUOTA_FALLBACK_MAX_PER_TURN) return next()
+      quotaFallbacks.set(signal, used + 1)
+    }
+    // next() 只能调用一次:先决定动作,不能兜底时再退给下一个监听器。
+    return rotateForFailure(pending.provider, pending.keyId, verdict.action).then(
+      rotated => {
+        if (!rotated) return next()
+        // 只在实际重发时打标记,避免污染同一 signal 上后续的正常请求计数。
+        recoveryRetries.add(signal)
+        ctx.logger.warn(`${pending.provider} 调用失败(${verdict.reason}),已自动换到下一把密钥`)
+        return { kind: 'retry' }
+      },
+      error => {
+        ctx.logger.warn(`失效兜底失败(${pending.provider}): ${error?.message ?? error}`)
+        return next()
+      },
+    )
+  }), 'dsh-key-managment: 调用失败自动换钥')
 
   // 定时轮换:每 60 秒先以磁盘同步配置(陈旧实例自愈),再检查 interval 到点。
   ctx.effect(() => {
@@ -983,7 +1199,7 @@ export function apply(ctx, config) {
           const rotation = normalizeRotation(record.rotation)
           if (shouldRotateInterval(rotation, record.lastRotatedAt ?? 0, now)) {
             void rotateToNext(record.provider).catch((error) => {
-              ctx.warn?.(`定时轮换失败(${record.provider}): ${error?.message ?? error}`)
+              ctx.logger.warn(`定时轮换失败(${record.provider}): ${error?.message ?? error}`)
             })
           }
         }

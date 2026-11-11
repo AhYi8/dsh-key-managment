@@ -2,9 +2,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  classifyStreamFailure,
   digestOf,
   findKeyByDigest,
+  healthFromQuota,
   hitValue,
+  isFallbackFailureChunk,
+  isStreamContentChunk,
   mergeRuntimeState,
   newProviderRecord,
   nextAlias,
@@ -12,6 +16,7 @@ import {
   parseAction,
   probeRoundDelay,
   projectProvider,
+  QUOTA_COOLDOWN_MS,
   redactSecret,
   settleKeyHealth,
   tailOf,
@@ -655,4 +660,123 @@ test('isSelectable 跳过值已缺失的密钥', async () => {
   const now = 1_000_000
   assert.equal(isSelectable({ health: 'ok', valueMissing: true }, now), false)
   assert.equal(isSelectable({ health: 'ok', valueMissing: false }, now), true)
+})
+
+/**
+ * 调用失败兜底判定。
+ *
+ * 这些用例的措辞都来自厂商官方错误码文档:同一类「额度不足」在不同厂商
+ * 落在 401/402/403/429 四个不同状态码上,只看归一化码必然漏判或误判。
+ */
+test('classifyStreamFailure:凭据级失败判 invalid(含厂商原生形态)', () => {
+  const cases = [
+    // 消息里带状态码的常见形态
+    { code: 'AUTH', message: '401: {"error":{"message":"Incorrect API key provided"}}' },
+    { code: 'AUTH', message: '401: {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}' },
+    { code: 'AUTH', message: '401: {"error":{"code":"1000","message":"身份验证失败"}}' },
+    { code: 'AUTH', message: '401: {"code":"InvalidApiKey","message":"Invalid API-key provided."}' },
+    // DSH 原生形态:message 只是厂商文案,没有状态码前缀
+    { code: 'AUTH', message: 'Authentication Fails' },
+    { code: 'AUTH', message: 'Unauthorized' },
+    { code: 'AUTH', message: '认证失败' },
+    // 有些厂商把无效密钥报成 400 / 403
+    { code: 'INVALID_REQUEST', message: '400: {"error":{"message":"API key not valid. Please pass a valid API key."}}' },
+    { code: 'AUTH', message: '403: The API key is disabled' },
+    { code: 'AUTH', message: '403: {"error":{"message":"该密钥已被停用"}}' },
+    // OpenRouter / DSH 本地判定的独立码
+    { code: 'PI_AI_ERROR', message: '401: {"error":{"code":401,"message":"Invalid credentials"}}' },
+    { code: 'INVALID_CREDENTIAL', message: '' },
+    // 只有 status 没有措辞
+    { code: 'PI_AI_ERROR', status: 401, message: 'unauthorized' },
+  ]
+  for (const failure of cases) {
+    assert.equal(classifyStreamFailure(failure).action, 'invalid', JSON.stringify(failure))
+  }
+})
+
+test('classifyStreamFailure:额度/欠费不论落在哪个状态码都判为额度级', () => {
+  const cases = [
+    // DeepSeek 官方 402
+    { code: 'QUOTA', message: '402: Insufficient Balance' },
+    // DashScope 欠费:HTTP 403,DSH 会把它归一化成 AUTH —— 最大的误判陷阱
+    { code: 'AUTH', message: '403: {"code":"Arrearage","message":"Access denied, please make sure your account is in good standing."}' },
+    // OpenAI 账单类 429:归一化码可能是 RATE_LIMIT
+    { code: 'RATE_LIMIT', message: '429: {"error":{"type":"insufficient_quota","code":"insufficient_quota"}}' },
+    { code: 'AUTH', message: '429: credit_balance_exhausted' },
+    // Kimi 账户欠费:429 + exceeded_current_quota_error,消息语序与英文惯用式相反
+    { code: 'RATE_LIMIT', message: '429: {"error":{"type":"exceeded_current_quota_error","message":"Account balance is insufficient"}}' },
+    // 智谱 1113:中文欠费,英文正则命中不了
+    { code: 'RATE_LIMIT', message: '429: {"error":{"code":"1113","message":"您的账户已欠费,请充值后重试"}}' },
+    // OpenRouter 402 / Anthropic 402 billing_error / 400 spend limit / 403 预算耗尽
+    { code: 'PI_AI_ERROR', message: '402: {"error":{"metadata":{"error_type":"payment_required"}}}' },
+    { code: 'PI_AI_ERROR', message: '402: {"type":"error","error":{"type":"billing_error","message":"Your credit balance is too low"}}' },
+    { code: 'INVALID_REQUEST', message: '400: You have reached your spend limit' },
+    { code: 'AUTH', message: '403: {"error":{"message":"Key limit exceeded (total budget)"}}' },
+    // DSH 的独立额度码与裸 status
+    { code: 'ACCOUNT_QUOTA', message: '' },
+    { code: 'QUOTA', message: '' },
+    { code: 'PI_AI_ERROR', status: 402, message: '' },
+  ]
+  for (const failure of cases) {
+    assert.equal(classifyStreamFailure(failure).action, 'quota', JSON.stringify(failure))
+  }
+})
+
+test('classifyStreamFailure:账户/策略/权限/基础设施类失败不换钥', () => {
+  const cases = [
+    // 组织策略
+    { code: 'AUTH', message: '401: {"error":{"message":"CORS requests are not allowed for this Organization"}}' },
+    { code: 'AUTH', message: '401: {"error":{"message":"You must be a member of an organization to use the API"}}' },
+    // 密钥有效但没有该模型/资源的权限:换钥未必有用,更不能标 invalid
+    { code: 'AUTH', message: '403: {"type":"error","error":{"type":"permission_error","message":"Your API key does not have permission to use the specified model"}}' },
+    { code: 'AUTH', message: '403: {"error":{"message":"Authentication service unavailable"}}' },
+    // 账户被停用属于账户状态,不是这把钥的问题
+    { code: 'AUTH', message: '401: Your account has been disabled' },
+    // 同时命中认证与账户措辞时按账户处理(排除分支的用例)
+    { code: 'AUTH', message: '401: invalid api key for organization acme' },
+  ]
+  for (const failure of cases) {
+    assert.equal(classifyStreamFailure(failure).action, 'none', JSON.stringify(failure))
+  }
+})
+
+test('classifyStreamFailure:普通限流、上下文与无关错误不动密钥', () => {
+  assert.equal(classifyStreamFailure({ code: 'RATE_LIMIT', message: '429 Too Many Requests' }).action, 'none')
+  assert.equal(classifyStreamFailure({ code: 'RATE_LIMIT', message: '429: {"error":{"type":"rate_limit_reached_error"}}' }).action, 'none')
+  assert.equal(classifyStreamFailure({ code: 'SERVER', message: '503 Service Unavailable' }).action, 'none')
+  assert.equal(classifyStreamFailure({ code: 'CONTEXT_WINDOW_EXCEEDED', message: 'context length exceeded' }).action, 'none')
+  assert.equal(classifyStreamFailure(undefined).action, 'none')
+  assert.equal(classifyStreamFailure(null).action, 'none')
+})
+
+test('isStreamContentChunk:usage 与 finish 不算已产出内容', () => {
+  // pi-ai 失败流固定先发 usage 再发错误 finish,把 usage 当内容会让兜底失效。
+  assert.equal(isStreamContentChunk({ type: 'usage', usage: {} }), false)
+  assert.equal(isStreamContentChunk({ type: 'finish', reason: { kind: 'stop' } }), false)
+  assert.equal(isStreamContentChunk({ type: 'text-delta', text: 'x' }), true)
+  assert.equal(isStreamContentChunk({ type: 'block-start', blockType: 'text' }), true)
+  assert.equal(isStreamContentChunk(null), false)
+})
+
+test('isFallbackFailureChunk 只认终止失败块', () => {
+  assert.equal(isFallbackFailureChunk({ type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH' } } }), true)
+  assert.equal(isFallbackFailureChunk({ type: 'finish', reason: { kind: 'stop' } }), false)
+  assert.equal(isFallbackFailureChunk({ type: 'finish', reason: { kind: 'aborted', failure: {} } }), false)
+  assert.equal(isFallbackFailureChunk({ type: 'text-delta', text: 'x' }), false)
+  assert.equal(isFallbackFailureChunk(null), false)
+  assert.equal(isFallbackFailureChunk({ type: 'finish', reason: null }), false)
+})
+
+test('额度冷却常量被余额窗口判定复用', () => {
+  // 不再断言常量本身(恒真),而是断言判定结果真的用了它。
+  const now = 1_000_000
+  const verdict = healthFromQuota({ status: 'ok', windows: [{ tier: 'balance', remainingValue: 0 }] }, 'ok', 0, now)
+  assert.equal(verdict.health, 'limited')
+  assert.equal(verdict.cooldownUntil, now + QUOTA_COOLDOWN_MS)
+})
+
+test('validateProbeConfig 拒绝非布尔的 fallbackOnFailure', () => {
+  assert.equal(validateProbeConfig({ fallbackOnFailure: false }), null)
+  assert.equal(validateProbeConfig({ fallbackOnFailure: true }), null)
+  assert.notEqual(validateProbeConfig({ fallbackOnFailure: 'false' }), null)
 })

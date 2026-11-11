@@ -1269,11 +1269,13 @@ window.__ModuleLoader__.load({
               quotaProbe: next.quotaProbe === true,
               quotaIntervalMs: next.quotaIntervalMs,
               quotaProbeGapMs: next.quotaProbeGapMs,
+              fallbackOnFailure: next.fallbackOnFailure !== false,
             }
             setValues({
               quotaProbe: next.quotaProbe,
               quotaIntervalMs: next.quotaIntervalMs,
               quotaProbeGapMs: next.quotaProbeGapMs,
+              fallbackOnFailure: next.fallbackOnFailure !== false,
             })
           })
           .catch(cause => { if (!cancelled) setError(cause?.message ?? String(cause)) })
@@ -1298,11 +1300,13 @@ window.__ModuleLoader__.load({
             quotaProbe: next.quotaProbe === true,
             quotaIntervalMs: next.quotaIntervalMs,
             quotaProbeGapMs: next.quotaProbeGapMs,
+            fallbackOnFailure: next.fallbackOnFailure !== false,
           }
           setValues({
             quotaProbe: next.quotaProbe,
             quotaIntervalMs: next.quotaIntervalMs,
             quotaProbeGapMs: next.quotaProbeGapMs,
+            fallbackOnFailure: next.fallbackOnFailure !== false,
           })
           setSaved(true)
         } catch (cause) {
@@ -1368,6 +1372,18 @@ window.__ModuleLoader__.load({
               },
             }),
             h('span', null, t('configQuotaProbe'))))
+          // 开关:调用失败自动换钥。与探测开关独立——探测关了兜底照样该工作。
+          children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' } },
+            h('input', {
+              type: 'checkbox',
+              checked: values.fallbackOnFailure === true,
+              onChange: event => {
+                const checked = event.target.checked
+                setValues(prev => ({ ...prev, fallbackOnFailure: checked }))
+                save({ fallbackOnFailure: checked })
+              },
+            }),
+            h('span', null, t('configFallback'))))
           // 数字:后台探测轮间隔(分钟);清空/非法时钳回服务端下限 1 分钟(审查 P1-2)。
           children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
             h('span', { style: { flex: 1 } }, t('configInterval')),
@@ -1483,8 +1499,9 @@ window.__ModuleLoader__.load({
         quotaRemaining: '剩余',
         quotaRefresh: '立即刷新',
         quotaFetchedAt: '探测于',
-        probeSettings: '后台探测',
+        probeSettings: '探测与兜底',
         configQuotaProbe: '启用密钥余额探测',
+        configFallback: '密钥失效或额度不足时自动切换',
         configInterval: '后台探测间隔(分钟)',
         configGap: '组内探测间隔',
         configSaved: '已保存',
@@ -1545,8 +1562,9 @@ window.__ModuleLoader__.load({
         quotaRemaining: 'remaining',
         quotaRefresh: 'Refresh now',
         quotaFetchedAt: 'Probed at',
-        probeSettings: 'Background probing',
+        probeSettings: 'Probing & fallback',
         configQuotaProbe: 'Enable key quota probing',
+        configFallback: 'Auto-switch on invalid key or quota exhaustion',
         configInterval: 'Background interval (minutes)',
         configGap: 'In-round gap',
         configSaved: 'Saved',
