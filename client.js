@@ -16,7 +16,10 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    const { useState, useEffect, useCallback, useRef } = React
+    const { useState, useEffect, useCallback, useRef, useContext } = React
+
+    /** 窄屏判定断点:手机 Web 视图统一用它,matchMedia 与语义共用一份。 */
+    const NARROW_MEDIA_QUERY = '(max-width: 480px)'
 
     /** 16px 线性图标集:path 是 24 视窗的描边路径。 */
     const ICON_PATHS = {
@@ -51,8 +54,14 @@ window.__ModuleLoader__.load({
       }))
     }
 
+    /** 窄屏布局上下文:面板子树内共享"手机布局"状态,控件免逐层传参。 */
+    const NarrowContext = React.createContext(false)
+
     /** 纯图标、无边框按钮:悬停有 title 提示;可选 onMouseDown 供弹层触发器防抖。 */
     function IconButton(props) {
+      // 触控目标:窄屏加到 32px,满足手机可点性;桌面保持 26px 紧凑布局。
+      const narrow = useContext(NarrowContext)
+      const buttonSize = narrow ? 32 : 26
       return h('button', {
         onClick: props.onClick,
         disabled: props.disabled,
@@ -63,8 +72,8 @@ window.__ModuleLoader__.load({
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 26,
-          height: 26,
+          width: buttonSize,
+          height: buttonSize,
           borderRadius: 7,
           border: 'none',
           background: props.primary
@@ -100,6 +109,38 @@ window.__ModuleLoader__.load({
       }, props.label)
     }
 
+    /**
+     * 窄屏(手机 Web 视图)判断:视口 ≤ 480px 视为移动端布局。
+     * matchMedia 不可用或非浏览器环境兜底返回 false,保持桌面行为不变。
+     * 多个组件共用同一 media query 实例的监听成本可忽略,不做全局单例。
+     */
+    function useNarrowScreen() {
+      const [narrow, setNarrow] = useState(() => {
+        try {
+          return window.matchMedia(NARROW_MEDIA_QUERY).matches
+        } catch {
+          return false
+        }
+      })
+      useEffect(() => {
+        let mediaQuery
+        try {
+          mediaQuery = window.matchMedia(NARROW_MEDIA_QUERY)
+        } catch {
+          return undefined
+        }
+        const onChange = (event) => setNarrow(event.matches)
+        // 老浏览器无 addEventListener: Safari < 14 用 addListener。
+        if (typeof mediaQuery.addEventListener === 'function') {
+          mediaQuery.addEventListener('change', onChange)
+          return () => mediaQuery.removeEventListener('change', onChange)
+        }
+        mediaQuery.addListener(onChange)
+        return () => mediaQuery.removeListener(onChange)
+      }, [])
+      return narrow
+    }
+
     /** 点击容器外部时触发 onClose(供弹层用)。 */
     function useOutside(open, ref, onClose) {
       useEffect(() => {
@@ -115,28 +156,57 @@ window.__ModuleLoader__.load({
           document.removeEventListener('keydown', onKey)
         }
       }, [open]) // eslint-disable-line react-hooks/exhaustive-deps
+      // 约束:onClose 必须是稳定引用(setState 类)。依赖只留 open 是刻意的,
+      // 否则每次父渲染都重绑 document 监听;传依赖渲染期变量的 onClose 会静默失效。
     }
 
     /**
      * tooltip 式弹层的公共外壳:绝对定位、小尺寸、暗边框,跟随锚点容器。
-     * 放在 position:relative 的父容器内,right:0 顶到锚点右缘。
+     * 放在 position:relative 的父容器内,默认 right:0 顶到锚点右缘、向左展开
+     * (锚点多在行右侧,左展不会撑破面板)。窄屏只钳宽,不改变对齐方向——
+     * 强制左对齐会让行尾弹层向右溢出,把面板顶出横向滚动(真机回归)。
      */
     function Popover(props) {
       const ref = useRef(null)
       useOutside(true, ref, props.onClose)
+      // 窄屏宽度:min() 混用单位合法,钳住视口但不超过原 minWidth。
+      const narrowWidth = props.narrow
+        ? { width: `min(${props.minWidth ?? 200}px, calc(100vw - 32px))`, minWidth: 0 }
+        : null
+      // 窄屏垂直居中(centered):锚点在行尾,原地弹出容易贴边/被裁,
+      // 改为 fixed 相对视口居中;桌面端一律保持原地弹出,不走该分支。
+      const centered = props.narrow && props.centered
       return h('div', {
         ref,
         onClick: event => event.stopPropagation(),
         style: {
-          position: 'absolute',
-          // flip=true 向上弹出:滚动面板底部的行,向下弹会被裁掉且滚不到(审查 P2-6)。
-          ...(props.flip
-            ? { bottom: 'calc(100% + 6px)' }
-            : { top: 'calc(100% + 6px)' }),
-          right: props.alignLeft ? undefined : 0,
-          left: props.alignLeft ? 0 : undefined,
+          ...(centered
+            ? {
+              position: 'fixed',
+              top: '50%',
+              left: 8,
+              right: 8,
+              transform: 'translateY(-50%)',
+              maxHeight: '80vh',
+              overflowY: 'auto',
+              margin: 'auto',
+              // left/right 双向约束下宽度由内容撑,钳住上限避免超宽。
+              width: 'fit-content',
+              maxWidth: 'calc(100vw - 32px)',
+            }
+            : {
+              position: 'absolute',
+              // flip=true 向上弹出:滚动面板底部的行,向下弹会被裁掉且滚不到(审查 P2-6)。
+              ...(props.flip
+                ? { bottom: 'calc(100% + 6px)' }
+                : { top: 'calc(100% + 6px)' }),
+              right: props.alignLeft ? undefined : 0,
+              left: props.alignLeft ? 0 : undefined,
+              ...narrowWidth,
+            }),
           zIndex: 80,
-          minWidth: props.minWidth ?? 200,
+          minWidth: props.narrow ? undefined : (props.minWidth ?? 200),
+          ...narrowWidth,
           padding: 10,
           borderRadius: 10,
           border: '1px solid var(--dsw-alias-border-secondary, #333)',
@@ -230,6 +300,8 @@ window.__ModuleLoader__.load({
     function QuotaRing(props) {
       const [open, setOpen] = useState(false)
       const wrapRef = useRef(null)
+      // 窄屏取值必须在顶层:不能放在条件表达式里,否则违反 Hooks 规则。
+      const narrow = useContext(NarrowContext)
       useOutside(open, wrapRef, () => setOpen(false))
       const payload = props.payload
       const balance = balanceWindowOf(payload)
@@ -316,7 +388,8 @@ window.__ModuleLoader__.load({
                 : null,
         )),
         // tooltip 式明细弹层:列各窗口用量 + 立即刷新(纯图标)。
-        open ? h(Popover, { minWidth: 230, flip: props.flip, onClose: () => setOpen(false) },
+        // narrow 从上下文取:手机布局下宽度钳在视口内、左对齐。
+        open ? h(Popover, { minWidth: 230, flip: props.flip, narrow, centered: true, onClose: () => setOpen(false) },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
             h('strong', null, `${props.alias} · ${props.t('quota')}`),
             h('div', { style: { flex: 1 } }),
@@ -372,19 +445,21 @@ window.__ModuleLoader__.load({
                       background: barColor,
                     },
                   })),
-                  h('div', { style: { opacity: 0.6 } }, `${formatReset(win.resetAt)} ${t('resetSuffix')}`))
+                  h('div', { style: { opacity: 0.6 } }, `${formatReset(win.resetAt)} ${props.t('resetSuffix')}`))
               })
               : h('div', { style: { opacity: 0.75 } },
                 payload.status === 'unsupported'
                   ? props.t('quotaUnsupported')
-                  : `${props.t('quotaError')}:${payload.error?.message ?? t('unknownError')}`),
+                  : `${props.t('quotaError')}:${payload.error?.message ?? props.t('unknownError')}`),
         ) : null,
       )
     }
 
     /** tooltip 式二次确认弹层:确认/取消都是纯图标。flip 决定向上/向下弹出。 */
     function ConfirmPopover(props) {
-      return h(Popover, { minWidth: 190, alignLeft: props.alignLeft, flip: props.flip, onClose: props.onCancel },
+      // 总是渲染在 NarrowContext.Provider 子树内,自读窄屏状态,免调用方逐层透传。
+      const narrow = useContext(NarrowContext)
+      return h(Popover, { minWidth: 190, alignLeft: props.alignLeft, flip: props.flip, narrow, onClose: props.onCancel },
         h('div', null, props.message),
         h('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' } },
           h(IconButton, {
@@ -394,11 +469,12 @@ window.__ModuleLoader__.load({
             disabled: props.busy,
             onClick: props.onConfirm,
           }),
-          h(IconButton, { icon: 'close', title: t('cancel'), onClick: props.onCancel })))
+          h(IconButton, { icon: 'close', title: props.t('cancel'), onClick: props.onCancel })))
     }
 
-    /** 小型文本输入行。 */
+    /** 小型文本输入行。窄屏加大内边距,保证手机上的触控目标高度。 */
     function TextField(props) {
+      const narrow = useContext(NarrowContext)
       return h('input', {
         type: props.type ?? 'text',
         value: props.value,
@@ -410,7 +486,7 @@ window.__ModuleLoader__.load({
         style: {
           flex: '1',
           minWidth: 0,
-          padding: '4px 8px',
+          padding: narrow ? '8px 10px' : '4px 8px',
           fontSize: 12,
           borderRadius: 6,
           border: '1px solid var(--dsw-alias-border-secondary, #333)',
@@ -453,6 +529,7 @@ window.__ModuleLoader__.load({
           current ? `${current.displayName}(${current.keyCount})` : '-'),
         h(Icon, { name: 'chevron', size: 12 })),
         // 展开式内联列表:撑开布局,不覆盖下方内容。
+        // 窄屏才钳宽截断;桌面保持原有溢出可见行为,不做视觉变化。
         open ? h('div', {
           style: {
             marginTop: 6,
@@ -462,6 +539,9 @@ window.__ModuleLoader__.load({
             display: 'flex',
             flexDirection: 'column',
             gap: 2,
+            ...(useContext(NarrowContext)
+              ? { maxWidth: '100%', overflow: 'hidden', boxSizing: 'border-box' }
+              : null),
           },
         },
         props.providers.map(entry => h('div', {
@@ -558,6 +638,10 @@ window.__ModuleLoader__.load({
             left: 0,
             zIndex: 70,
             minWidth: 130,
+            // 仅窄屏钳宽:桌面保持原有无上限宽度,长模式名可撑开。
+            ...(useContext(NarrowContext)
+              ? { maxWidth: 'min(180px, calc(100vw - 32px))' }
+              : null),
             padding: 4,
             borderRadius: 8,
             border: '1px solid var(--dsw-alias-border-secondary, #333)',
@@ -591,6 +675,8 @@ window.__ModuleLoader__.load({
 
     /** 悬浮框主体。 */
     function PoolPanel() {
+      // 手机布局:视口 ≤ 480px 时面板改为近全屏宽,子树通过上下文共享该状态。
+      const narrow = useNarrowScreen()
       const [state, setState] = useState(null)
       const [error, setError] = useState('')
       const [busy, setBusy] = useState(false)
@@ -869,7 +955,29 @@ window.__ModuleLoader__.load({
         : null
 
       // 添加单条密钥:密钥 + 名称 + “添加密钥”按钮
-      const addKeyBlock = h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+      // 手机:密钥输入框独占一行,名称与按钮一行——单行三控件在窄屏会被挤到不可用。
+      const addKeyButton = h('button', {
+        onClick: () => act('addKey', { value: newValue, alias: newAlias })
+          .then(ok => { if (ok) { setNewValue(''); setNewAlias('') } }),
+        disabled: busy || newValue.trim().length === 0,
+        title: t('addKey'),
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 4,
+          flex: 'none',
+          padding: narrow ? '8px 12px' : '4px 10px',
+          fontSize: 12,
+          borderRadius: 6,
+          border: 'none',
+          background: 'var(--dsw-alias-bg-accent, #4a6cf7)',
+          color: 'var(--dsw-alias-fg-on-accent, #fff)',
+          cursor: busy || newValue.trim().length === 0 ? 'default' : 'pointer',
+          opacity: busy || newValue.trim().length === 0 ? 0.45 : 1,
+          whiteSpace: 'nowrap',
+        },
+      }, h(Icon, { name: 'plus', size: 13 }), t('addKey'))
+      const addKeyFields = h(React.Fragment, null,
         h(TextField, {
           value: newValue,
           placeholder: t('keyPlaceholder'),
@@ -880,28 +988,16 @@ window.__ModuleLoader__.load({
           value: newAlias,
           placeholder: t('aliasPlaceholder'),
           onChange: setNewAlias,
-        }),
-        h('button', {
-          onClick: () => act('addKey', { value: newValue, alias: newAlias })
-            .then(ok => { if (ok) { setNewValue(''); setNewAlias('') } }),
-          disabled: busy || newValue.trim().length === 0,
-          title: t('addKey'),
-          style: {
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            flex: 'none',
-            padding: '4px 10px',
-            fontSize: 12,
-            borderRadius: 6,
-            border: 'none',
-            background: 'var(--dsw-alias-bg-accent, #4a6cf7)',
-            color: 'var(--dsw-alias-fg-on-accent, #fff)',
-            cursor: busy || newValue.trim().length === 0 ? 'default' : 'pointer',
-            opacity: busy || newValue.trim().length === 0 ? 0.45 : 1,
-            whiteSpace: 'nowrap',
-          },
-        }, h(Icon, { name: 'plus', size: 13 }), t('addKey')))
+        }))
+      const addKeyBlock = narrow
+        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          addKeyFields,
+          h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+            h('div', { style: { flex: 1 } }),
+            addKeyButton))
+        : h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+          addKeyFields,
+          addKeyButton)
 
       // 批量添加:展开文本域,每行一个密钥
       const batchToggle = h('button', {
@@ -1135,15 +1231,34 @@ window.__ModuleLoader__.load({
       // 后台探测设置:与供应商无关,始终挂在面板底部。
       children.push(h(ProbeConfigSection))
 
-      return h('div', {
+      return h(NarrowContext.Provider, { value: narrow }, h('div', {
         style: {
-          position: 'absolute',
-          top: 'calc(100% + 6px)',
-          // 面板贴屏幕右缘展开(按钮在会话头部右侧)。
-          right: 0,
-          width: 390,
-          maxHeight: 540,
+          // 桌面:绝对定位贴按钮右缘,固定 390px。
+          // 手机:面板的定位基准是入口按钮的小容器,绝对定位会被它钳宽/算错偏移,
+          // 改为 fixed 相对视口:left/right 双向 8px,顶部取按钮底缘实测值。
+          ...(narrow
+            ? {
+              position: 'fixed',
+              // 手机:相对可视界面垂直居中,不再贴按钮下方(按钮测量在滚动/
+              // 旋转后会漂移);transform 只作用在面板自身,不影响内部弹层。
+              top: '50%',
+              left: 8,
+              right: 8,
+              width: 'auto',
+              transform: 'translateY(-50%)',
+              maxHeight: 'calc(100vh - 24px)',
+            }
+            : {
+              position: 'absolute',
+              top: 'calc(100% + 6px)',
+              right: 0,
+              width: 390,
+              maxHeight: 540,
+            }),
           overflowY: 'auto',
+          // 兜底:overflowY auto 会把横向也变成可滚,一旦子元素超宽就出现
+          // 内部横向滚动条、左侧标签被滚出可视区;禁掉横向滚动,超宽裁切。
+          overflowX: 'hidden',
           zIndex: 60,
           padding: 12,
           borderRadius: 10,
@@ -1157,7 +1272,7 @@ window.__ModuleLoader__.load({
           fontSize: 12,
         },
         onClick: event => event.stopPropagation(),
-      }, children)
+      }, children))
     }
 
     /** 头部工具按钮 + 悬浮框容器。 */
@@ -1638,7 +1753,7 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       apply(ctx) {
         // 构建标记:控制台可确认页面加载的是哪一代客户端代码。
-        console.info('[dsh-key-managment] client build 2026-11-07.5 (remaining-semantics + safe-slot)')
+        console.info('[dsh-key-managment] client build 2026-11-14.1 (mobile-adaptive + remaining-semantics + safe-slot)')
 
         // 全局错误捕获:任何未捕获异常/拒绝都打上插件标记,便于定位崩溃点。
         ctx.effect(() => {
