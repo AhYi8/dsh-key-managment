@@ -1264,7 +1264,12 @@ window.__ModuleLoader__.load({
               right: 8,
               width: 'auto',
               transform: 'translateY(-50%)',
-              maxHeight: 'calc(100vh - 24px)',
+              // 在居中基础上整体下移:顶部多留出空间,不遮住应用的顶部栏
+              // (顶部间隙≈15vh,底部仍剩≈5vh 可点外部关闭)。
+              marginTop: '5vh',
+              // 高度上限 80vh:满屏面板会把视口占满,四周没有可点击的
+              // "外部区域",手机上就无法点外部关闭了(与弹层保持同一上限)。
+              maxHeight: '80vh',
             }
             : {
               position: 'absolute',
