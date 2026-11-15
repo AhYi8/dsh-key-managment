@@ -330,6 +330,24 @@ export const LIMIT_COOLDOWN_BASE_MS = 60_000
 export const LIMIT_COOLDOWN_MAX_MS = 30 * 60_000
 
 /**
+ * 「账号无 coding 套餐」的固定冷却时长。
+ *
+ * 智谱等 coding plan 供应商对没订阅套餐的账号,额度端点直接报
+ * 「当前用户不存在 coding plan」:这不是探测自身的问题,而是资格缺失——
+ * 订阅前这把密钥必然不可用。按限流处理但给一整天冷却(套餐不会几分钟内
+ * 变出来),到期后下一轮探测重新判定,用户订阅完即自动恢复。
+ */
+export const NO_PLAN_COOLDOWN_MS = 24 * 60 * 60_000
+
+/**
+ * 「账号无 coding 套餐」的措辞:中文为智谱实机文案,英文覆盖其它供应商。
+ * MiniMax 的两条是实机采集:无订阅是「no active token plan subscription」,
+ * 而无资格账号走会话鉴权,报「cookie is missing, log in again」——按厂商
+ * 语义这是资格缺失而非密钥失效,判 invalid 会误伤整池。
+ */
+const NO_PLAN_TEXT = /不存在\s*coding\s*plan|no\s+coding[\s_-]?plan|coding[\s_-]?plan.{0,12}(?:not\s+(?:exist|found|available)|missing)|未开通.{0,6}(?:coding\s*)?套餐|no\s+active[^\n]{0,24}\bplan\b(?:\s+subscription)?|cookie\s+is\s+missing/i
+
+/**
  * 从一次余额探测结果推导密钥健康状态。
  *
  * - ok 且所有窗口用量 <100%      → ok(有效)
@@ -383,6 +401,10 @@ export function healthFromQuota(payload, prev, prevLevel, now, prevCooldown = 0)
       const level = Math.min((prevLevel ?? 0) + 1, 30)
       const cooldownMs = Math.min(LIMIT_COOLDOWN_MAX_MS, LIMIT_COOLDOWN_BASE_MS * 2 ** level)
       return { health: 'limited', cooldownUntil: now + cooldownMs, level }
+    }
+    // 账号没订阅 coding 套餐:限流一天(level 归零,不参与指数退避)。
+    if (NO_PLAN_TEXT.test(message)) {
+      return { health: 'limited', cooldownUntil: now + NO_PLAN_COOLDOWN_MS, level: 0 }
     }
     // parse/network 等:探测自身问题,不改判密钥——冷却时间也原样保留。
     return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0 }
@@ -445,10 +467,15 @@ export const QUOTA_COOLDOWN_MS = 10 * 60_000
  * 智谱是 429 + 中文「账户已欠费」,DashScope 是 403 + `Arrearage`,
  * OpenRouter 是 402 + `payment_required`,Anthropic 是 402 + `billing_error`,
  * Kimi 是 429 + `exceeded_current_quota_error` 且消息形如
- * "Account balance is insufficient"(词序与英文惯用式相反)。
+ * "Account balance is insufficient"(词序与英文惯用式相反);
+ * 智谱无套餐账号是「当前用户不存在 coding plan」——资格缺失与欠费同级,
+ * 换到池内其他密钥仍可能成功,不该当密钥无效拉黑;
+ * MiniMax 无订阅是「no active token plan subscription」,无资格账号走
+ * 会话鉴权报「cookie is missing, log in again」,同级处理。措辞集与
+ * 上方 NO_PLAN_TEXT 保持一致:探测判"无套餐"的错误,真实调用也应换钥。
  * DSH 归一化后只有部分厂商落到 QUOTA,因此必须按措辞再兜一层。
  */
-const QUOTA_FAILURE_TEXT = /insufficient[\s_-]?(?:quota|balance|credits?|funds)|exceeded_current_quota|credit[_-]?balance[_-]?exhausted|spend[\s_-]?limit|budget[\s_-]?(?:exceeded|exhausted|limit)|total[\s_-]?budget|key[\s_-]?limit[\s_-]?exceeded|payment[_-]?required|billing_error|arrearage|credit balance is too low|out of credits|(?:quota|balance|credits?)\b[^.]{0,24}(?:insufficient|exhausted|depleted|不足)|余额不足|余额已不足|账户欠费|欠费|额度不足/i
+const QUOTA_FAILURE_TEXT = /insufficient[\s_-]?(?:quota|balance|credits?|funds)|exceeded_current_quota|credit[_-]?balance[_-]?exhausted|spend[\s_-]?limit|budget[\s_-]?(?:exceeded|exhausted|limit)|total[\s_-]?budget|key[\s_-]?limit[\s_-]?exceeded|payment[_-]?required|billing_error|arrearage|credit balance is too low|out of credits|(?:quota|balance|credits?)\b[^.]{0,24}(?:insufficient|exhausted|depleted|不足)|余额不足|余额已不足|账户欠费|欠费|额度不足|不存在\s*coding\s*plan|no\s+coding[\s_-]?plan|coding[\s_-]?plan.{0,12}(?:not\s+(?:exist|found|available)|missing)|未开通.{0,6}(?:coding\s*)?套餐|no\s+active[^\n]{0,24}\bplan\b(?:\s+subscription)?|cookie\s+is\s+missing/i
 
 /**
  * 账户/策略类措辞。

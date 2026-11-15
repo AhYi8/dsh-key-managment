@@ -7,7 +7,7 @@
 - **密钥池**：按提供商配置多把 API 密钥，随时手动切换生效密钥
 - **失效兜底**：调用遇密钥无效/额度不足时自动切到池内下一把并重放本次请求（可在设置中关闭）
 - **后台探测**：按可配置的间隔对密钥做可达性探测，启动即跑一轮
-- **用量展示**：内置多家服务商的套餐余量适配器（DeepSeek 余额、Kimi Coding、MiniMax、智谱 / Z.ai、OpenRouter、Command Code、OpenCode Go、Magpie 等）
+- **用量展示**：内置多家服务商的套餐余量适配器（DeepSeek 余额、Kimi Coding、MiniMax、智谱 / Z.ai、OpenRouter、Command Code、OpenCode Go、Magpie 等）；明细弹层标题展示订阅套餐等级（如 lite / pro），Magpie 多账号窗口按额度池标注 pool
 - **Web 设置界面**：在 DSH 浏览器端提供配置与切换入口
 - **密钥脱敏**：界面与日志中自动脱敏展示密钥
 - **WebDAV 备份**：定时把密钥池快照加密（AES-256-GCM）上传到 WebDAV，手动选版本覆盖恢复；每设备各保留 N 份自动轮转

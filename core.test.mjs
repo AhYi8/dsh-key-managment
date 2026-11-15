@@ -175,6 +175,37 @@ test('healthFromQuota:按探测结果推导有效/限流/无效', async () => {
   assert.equal(healthFromQuota({ status: 'error', error: { kind: 'parse', message: 'x' } }, 'ok', 0, now).health, 'ok')
 })
 
+test('healthFromQuota:账号无 coding 套餐 → 限流一天', async () => {
+  const { healthFromQuota, NO_PLAN_COOLDOWN_MS } = await import('./core.js')
+  const now = 1_000_000
+  // 智谱实机措辞:账号没订阅 coding 套餐。订阅前这把密钥必然不可用,
+  // 按"限流一天"冷却,而不是永远停在未知。
+  const verdict = healthFromQuota(
+    { status: 'error', error: { kind: 'parse', message: 'API error: 当前用户不存在 coding plan' } },
+    'unknown', 0, now)
+  assert.equal(verdict.health, 'limited')
+  assert.equal(verdict.cooldownUntil, now + NO_PLAN_COOLDOWN_MS)
+  // 其它 coding plan 供应商的英文措辞同样覆盖。
+  assert.equal(healthFromQuota(
+    { status: 'error', error: { kind: 'http', message: 'no coding plan for this user' } },
+    'unknown', 0, now).health, 'limited')
+  // 冷却到期后的下一轮探测重新判定,不因级别残留而延长。
+  const again = healthFromQuota(
+    { status: 'error', error: { kind: 'parse', message: '当前用户不存在 coding plan' } },
+    'limited', 5, now, now + NO_PLAN_COOLDOWN_MS)
+  assert.equal(again.health, 'limited')
+  assert.equal(again.cooldownUntil, now + NO_PLAN_COOLDOWN_MS)
+  assert.equal(again.level, 0)
+  // MiniMax 的两种无套餐/无资格措辞:直接文案,与会话 cookie 缺失。
+  for (const message of ['no active token plan subscription', 'cookie is missing, log in again']) {
+    const minimax = healthFromQuota(
+      { status: 'error', error: { kind: 'parse', message } },
+      'unknown', 0, now)
+    assert.equal(minimax.health, 'limited')
+    assert.equal(minimax.cooldownUntil, now + NO_PLAN_COOLDOWN_MS)
+  }
+})
+
 test('healthFromQuota:余额型窗口按官方可用性与余额判定', async () => {
   const { healthFromQuota } = await import('./core.js')
   const now = 1_000_000

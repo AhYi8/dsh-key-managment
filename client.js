@@ -393,7 +393,13 @@ window.__ModuleLoader__.load({
         // narrow 从上下文取:手机布局下宽度钳在视口内、左对齐。
         open ? h(Popover, { minWidth: 230, flip: props.flip, narrow, centered: true, onClose: () => setOpen(false) },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-            h('strong', null, `${props.alias} · ${props.t('quota')}`),
+            h('strong', null,
+              props.alias,
+              // 订阅等级随探测负载透传(如 zhipu data.level):供应商原词原样展示,不翻译。
+              // 标题不带"余额/额度"字样:套餐型窗口没有余额语义,与 token-usage 的"名称 · 等级"一致。
+              payload?.status === 'ok' && payload.planTier !== undefined
+                ? h('span', { style: { opacity: 0.65, fontWeight: 'normal' } }, ` · ${payload.planTier}`)
+                : null),
             h('div', { style: { flex: 1 } }),
             h(IconButton, {
               icon: 'refresh',

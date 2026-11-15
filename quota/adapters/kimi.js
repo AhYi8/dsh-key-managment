@@ -129,6 +129,15 @@ export const kimiAdapter = {
         if (monthly !== undefined)
             windows.push(monthly);
         if (windows.length === 0) {
+            // 完全没有任何额度结构(limits 缺失/为空且无 usages):Kimi 对没订阅
+            // coding 套餐的账号就是这样回答的。报"no coding plan"措辞,让
+            // healthFromQuota 归到"限流一天",而不是永远停在未知。
+            if (!Array.isArray(record.limits) || record.limits.length === 0) {
+                if (usages === undefined)
+                    throw new QuotaQueryError('parse', 'no coding plan: the account reports no limit buckets');
+            }
+            // 有结构但一个都认不出:响应形状又变了,保持原报错(探测自身问题
+            // 不改判密钥),等上游适配器跟进新形状。
             throw new QuotaQueryError('parse', 'no usable limit buckets in response');
         }
         return { windows };

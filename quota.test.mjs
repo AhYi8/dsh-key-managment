@@ -11,6 +11,8 @@ import { healthFromQuota } from './core.js'
 import { deepseekBalanceAdapter } from './quota/adapters/deepseek-balance.js'
 import { minimaxAdapter } from './quota/adapters/minimax.js'
 import { zhipuAdapter } from './quota/adapters/zhipu.js'
+import { magpieAdapter } from './quota/adapters/magpie.js'
+import { kimiAdapter } from './quota/adapters/kimi.js'
 
 /** 构造一个可控的 fetch:返回指定 JSON,并记录请求参数。 */
 function stubFetch(body, { status = 200 } = {}) {
@@ -180,6 +182,8 @@ test('zhipu 适配器:用量比例按额度算术得出,用尽即为 100%', asyn
   const body = {
     success: true,
     data: {
+      // data.level 是订阅套餐等级(lite/pro),适配器要原样透传给弹层展示。
+      level: 'lite',
       limits: [
         {
           type: 'CREDIT_LIMIT',
@@ -206,6 +210,8 @@ test('zhipu 适配器:用量比例按额度算术得出,用尽即为 100%', asyn
   // 用尽 → 已用 100% → 限流。
   assert.equal(result.windows[0].usedPercent, 100)
   assert.equal(healthFromQuota({ status: 'ok', windows: result.windows }, 'ok', 0, 1_000_000).health, 'limited')
+  // 订阅等级随结果透传,供客户端弹层标题展示。
+  assert.equal(result.planTier, 'lite')
 })
 
 /* ---------------------- DeepSeek 官方余额(/user/balance) ---------------------- */
@@ -321,4 +327,106 @@ test('deepseek-balance 适配器:401 归为 auth,健康判定为无效', async (
       fetchFn,
     }),
     error => error?.kind === 'auth')
+})
+
+/* ---------------------- Kimi Coding(无套餐账号) ---------------------- */
+
+test('kimi 适配器:完全无额度结构的响应按"无套餐"报错', async () => {
+  // Kimi 对没订阅 coding 套餐的账号,usages 端点答 200 但没有任何额度结构;
+  // 报"no coding plan"措辞,healthFromQuota 会归到"限流一天"。
+  const emptyBodies = [{}, { limits: [] }, { usages: null }]
+  for (const body of emptyBodies) {
+    const { fetchFn } = stubFetch(body)
+    await assert.rejects(
+      () => kimiAdapter.query({
+        provider: 'kimi-coding',
+        apiKey: 'sk-test',
+        fetchFn,
+      }),
+      error => error?.kind === 'parse' && /no coding plan/.test(error.message))
+  }
+})
+
+test('kimi 适配器:有额度结构但不可识别时报通用 parse 错误', async () => {
+  // 有 limits/usages 结构但内容认不出:响应形状又变了,探测自身问题不改判,
+  // 不能误当"无套餐"把有效密钥限流一天。
+  const body = { limits: [{ detail: {} }], usages: { limit_5h: 'not-a-shape' } }
+  const { fetchFn } = stubFetch(body)
+  await assert.rejects(
+    () => kimiAdapter.query({
+      provider: 'kimi-coding',
+      apiKey: 'sk-test',
+      fetchFn,
+    }),
+    error => error?.kind === 'parse' && /no usable limit buckets/.test(error.message))
+})
+
+/* ---------------------- Magpie 网关(pool 额度池) ---------------------- */
+
+/** magpie 报告里的一张配额卡片:zcode 供应商的一个账号。 */
+function magpieCard(overrides = {}) {
+  return {
+    provider: 'zcode',
+    name: 'ZCode',
+    kind: 'plan',
+    plan: 'lite',
+    user: 'acct-1',
+    windows: [{ name: '5 hours', used: 40 }, { name: 'Weekly', used: 20 }],
+    ...overrides,
+  }
+}
+
+test('magpie 适配器:窗口按 provider::name 写入 pool,同供应商多账号共池', async () => {
+  // 同一供应商两个账号、两个套餐:网关会在它们之间调度流量,
+  // 预算可互换,所以池 id 必须一致;套餐(lite/pro)与账号不参与分池。
+  const body = {
+    data: [
+      magpieCard(),
+      magpieCard({ plan: 'pro', user: 'acct-2', windows: [{ name: '5 hours', used: 80 }] }),
+    ],
+  }
+  const { fetchFn } = stubFetch(body)
+  const result = await magpieAdapter.query({
+    provider: 'magpie',
+    baseUrl: 'http://127.0.0.1:3425/v1',
+    apiKey: '',
+    fetchFn,
+  })
+  const pools = result.windows.filter(w => w.tier === 'five_hour').map(w => w.pool)
+  assert.deepEqual(pools, ['zcode::ZCode', 'zcode::ZCode'])
+})
+
+test('magpie 适配器:不同供应商的池互不相同', async () => {
+  // 不同供应商的同名窗口是不相关的预算,绝不能均到一起。
+  const body = {
+    data: [
+      magpieCard(),
+      magpieCard({ provider: 'zme', name: 'ZMe' }),
+    ],
+  }
+  const { fetchFn } = stubFetch(body)
+  const result = await magpieAdapter.query({
+    provider: 'magpie',
+    baseUrl: 'http://127.0.0.1:3425/v1',
+    apiKey: '',
+    fetchFn,
+  })
+  const pools = [...new Set(result.windows.map(w => w.pool))]
+  assert.deepEqual(pools.sort(), ['zcode::ZCode', 'zme::ZMe'])
+})
+
+test('magpie 适配器:余额窗口也携带 pool', async () => {
+  const body = {
+    data: [magpieCard({ kind: 'balance', balance: '¥356.81', windows: [] })],
+  }
+  const { fetchFn } = stubFetch(body)
+  const result = await magpieAdapter.query({
+    provider: 'magpie',
+    baseUrl: 'http://127.0.0.1:3425/v1',
+    apiKey: '',
+    fetchFn,
+  })
+  assert.equal(result.windows[0].tier, 'balance')
+  assert.equal(result.windows[0].remainingValue, 356.81)
+  assert.equal(result.windows[0].pool, 'zcode::ZCode')
 })
