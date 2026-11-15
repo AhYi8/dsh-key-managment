@@ -296,11 +296,17 @@ export function normalizeRestoredSnapshot(raw) {
     if (typeof record.provider !== 'string' || record.provider.length === 0) continue
     if (typeof record.keyRef !== 'string' || record.keyRef.length === 0) continue
     const keys = Array.isArray(record.keys) ? record.keys : []
-    const cleanedKeys = keys
-      .filter(key => key !== null && typeof key === 'object'
-        && typeof key.id === 'string' && key.id.length > 0
-        && typeof key.value === 'string' && key.value.length > 0)
-      .map(key => ({
+    // 密钥 id 在池内必须唯一:快照若含重复 id,按 id 的查找与生效指针
+    // 会命中任意一把。这里只保留每个 id 的首次出现,防畸形备份。
+    const seenIds = new Set()
+    const cleanedKeys = []
+    for (const key of keys) {
+      if (key === null || typeof key !== 'object') continue
+      if (typeof key.id !== 'string' || key.id.length === 0) continue
+      if (typeof key.value !== 'string' || key.value.length === 0) continue
+      if (seenIds.has(key.id)) continue
+      seenIds.add(key.id)
+      cleanedKeys.push({
         id: key.id,
         alias: typeof key.alias === 'string' && key.alias.length > 0 ? key.alias : 'Key_1',
         createdAt: typeof key.createdAt === 'number' ? key.createdAt : 0,
@@ -309,7 +315,8 @@ export function normalizeRestoredSnapshot(raw) {
         cooldownUntil: typeof key.cooldownUntil === 'number' && key.cooldownUntil > 0 ? key.cooldownUntil : 0,
         cooldownLevel: typeof key.cooldownLevel === 'number' && key.cooldownLevel > 0 ? Math.round(key.cooldownLevel) : 0,
         value: key.value,
-      }))
+      })
+    }
     providers[provider] = {
       provider: record.provider,
       displayName: typeof record.displayName === 'string' ? record.displayName : record.provider,

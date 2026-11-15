@@ -1402,7 +1402,9 @@ export function apply(ctx, config) {
       if (deletedFailures.length > 0) {
         ctx.logger.warn(`备份轮转存在未删除的旧备份: ${deletedFailures.join('; ')}`)
       }
-      return { ok: true, file: name, deletedFailures, ...view() }
+      // view 是 async 函数:必须 await 后再展开,否则展开的是 Promise 实例,
+      // 得到空对象,响应缺失 providers/available 等全量状态字段。
+      return { ok: true, file: name, deletedFailures, ...(await view()) }
     } finally {
       backupInFlight = false
     }
@@ -1434,29 +1436,59 @@ export function apply(ctx, config) {
     // 补偿:写入中途失败时,已写入的新引用会成为状态文件里没有的孤儿明文,
     // 必须尽力清理;persist 失败同理(状态未落盘,新引用同样是孤儿)。
     const appliedRefs = []
+    const previousProviders = state.providers
     try {
       for (const entry of plan.refsToSet) {
         await ctx.credentials.set(entry.ref, entry.value)
         appliedRefs.push(entry.ref)
       }
-      for (const ref of plan.refsToUnset) {
-        try {
-          await ctx.credentials.unset(ref)
-        } catch {
-          // 与 deleteKey 同理:状态文件已不含该引用,残留凭据无害。
+      // 按调用次数轮换的进度取较大值:恢复不应把本进程已累计的调用计数
+      // 倒退回备份时刻,否则"按次数轮换"会重新数一遍(与 syncProvidersFromDisk
+      // 保留内存较大值的口径一致)。
+      for (const [provider, record] of Object.entries(plan.providers)) {
+        const live = previousProviders[provider]
+        if (live !== undefined && typeof live.requestCount === 'number'
+          && live.requestCount > record.requestCount) {
+          record.requestCount = live.requestCount
         }
       }
       state.providers = plan.providers
       await persist()
     } catch (error) {
+      // persist 失败时内存态必须一并回滚:只回滚凭据会留下"内存=恢复后、
+      // 磁盘=恢复前"的混合态,后续 syncProvidersFromDisk 的并集合并会把
+      // 两边记录混在一起,旧记录引用的池凭据还已被清掉,指向空值。
+      state.providers = previousProviders
       for (const ref of appliedRefs) {
         try { await ctx.credentials.unset(ref) } catch { /* 尽力清理 */ }
       }
       throw error
     }
+    // 落盘成功后才清旧池引用:清到一半出错也不影响已持久化的新状态,
+    // 残留的旧引用(明文孤儿)与原注释口径一致,无害。
+    for (const ref of plan.refsToUnset) {
+      try {
+        await ctx.credentials.unset(ref)
+      } catch {
+        // 与 deleteKey 同理:状态文件已不含该引用,残留凭据无害。
+      }
+    }
+    // 清理被移除供应商的余额快照:quotaStore 不清理的话,view 会把已不存在
+    // 供应商的 quota 原样下发给界面。
+    const livePrefixes = new Set(Object.keys(state.providers))
+    for (const cacheKey of [...quotaStore.keys()]) {
+      if (!livePrefixes.has(cacheKey.split('\u0000')[0])) quotaStore.delete(cacheKey)
+    }
     for (const warning of plan.warnings) ctx.logger.warn(`恢复备份: ${warning}`)
+    // 恢复只替换了 state.providers,内存目录里的 managed 还是恢复前的旧值:
+    // 徽标读新状态显示"已纳入管理",可纳管列表却按旧标记把同一批供应商
+    // 再列一遍,两处自相矛盾。这里按新状态重算,再下发视图。
+    for (const entry of directory.values()) {
+      entry.managed = recordOf(entry.provider) !== undefined
+    }
     ctx.logger.info(`已从备份 ${parsed.name} 恢复 ${Object.keys(plan.providers).length} 个供应商的密钥池`)
-    return { ok: true, restored: Object.keys(plan.providers).length, warnings: plan.warnings, ...view() }
+    // view 是 async 函数:必须 await 后展开,否则得到空对象(同 runBackup)。
+    return { ok: true, restored: Object.keys(plan.providers).length, warnings: plan.warnings, ...(await view()) }
   }
 
   // 定时备份:每分钟检查一次,距上次触发满配置间隔即备份一次。
