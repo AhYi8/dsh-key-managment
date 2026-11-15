@@ -77,7 +77,9 @@ window.__ModuleLoader__.load({
           borderRadius: 7,
           border: 'none',
           background: props.primary
-            ? 'var(--dsw-alias-bg-accent, #4a6cf7)'
+            ? (props.danger
+              ? 'var(--dsw-alias-fg-danger, #e07070)'
+              : 'var(--dsw-alias-bg-accent, #4a6cf7)')
             : 'transparent',
           color: props.primary
             ? 'var(--dsw-alias-fg-on-accent, #fff)'
@@ -459,6 +461,11 @@ window.__ModuleLoader__.load({
     function ConfirmPopover(props) {
       // 总是渲染在 NarrowContext.Provider 子树内,自读窄屏状态,免调用方逐层透传。
       const narrow = useContext(NarrowContext)
+      // 翻译函数自给自足:调用方不传 t 时回退内置中文。此前依赖 props.t,
+      // 而三个调用点都没传——确认弹层一渲染就崩,把整个入口槽位拖垮。
+      const translate = props.t ?? fallbackText
+      // danger:危险操作(如恢复会覆盖整个密钥池)的确认按钮用红色区分,
+      // 避免与"纳入池"等良性确认在视觉上无法区分。
       return h(Popover, { minWidth: 190, alignLeft: props.alignLeft, flip: props.flip, narrow, onClose: props.onCancel },
         h('div', null, props.message),
         h('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' } },
@@ -466,10 +473,11 @@ window.__ModuleLoader__.load({
             icon: 'check',
             title: props.confirmLabel,
             primary: true,
+            danger: props.danger === true,
             disabled: props.busy,
             onClick: props.onConfirm,
           }),
-          h(IconButton, { icon: 'close', title: props.t('cancel'), onClick: props.onCancel })))
+          h(IconButton, { icon: 'close', title: translate('cancel'), onClick: props.onCancel })))
     }
 
     /** 小型文本输入行。窄屏加大内边距,保证手机上的触控目标高度。 */
@@ -480,6 +488,7 @@ window.__ModuleLoader__.load({
         value: props.value,
         placeholder: props.placeholder,
         onChange: event => props.onChange(event.target.value),
+        onBlur: props.onBlur,
         onKeyDown: event => {
           if (event.key === 'Enter' && props.onEnter) props.onEnter()
         },
@@ -1230,6 +1239,9 @@ window.__ModuleLoader__.load({
       }
       // 后台探测设置:与供应商无关,始终挂在面板底部。
       children.push(h(ProbeConfigSection))
+      // WebDAV 备份:同样与供应商无关,挂在探测设置之后。
+      // onPoolChanged:恢复整体覆盖密钥池后,让面板重拉状态刷新列表。
+      children.push(h(BackupSection, { onPoolChanged: () => run(() => api('getState')) }))
 
       return h(NarrowContext.Provider, { value: narrow }, h('div', {
         style: {
@@ -1299,7 +1311,9 @@ window.__ModuleLoader__.load({
           },
         },
         h(Icon, { name: 'key', size: 16 })),
-        open ? h(PoolPanel) : null,
+        // 错误边界下沉到面板层:面板渲染崩溃只藏面板,入口图标保留——
+        // 否则一次崩溃后连面板都打不开,只能刷新整个页面。
+        open ? h(SafeSlot, null, h(PoolPanel)) : null,
       )
     }
 
@@ -1556,6 +1570,343 @@ window.__ModuleLoader__.load({
       }, children)
     }
 
+    /**
+     * WebDAV 备份面板(收在悬浮框底部):配置 + 手动备份 + 云端备份列表与恢复。
+     * 默认折叠:备份是低频操作;展开时才拉取状态与备份列表。
+     *
+     * @param props.onPoolChanged 恢复会整体覆盖本地密钥池,成功后必须通知
+     *   父面板重新拉取状态,否则上方展示的还是恢复前的旧数据。
+     */
+    function BackupSection(props) {
+      const [open, setOpen] = useState(false)
+      /** 来自 getConfig 的配置;文本输入的受控值。 */
+      const [values, setValues] = useState(null)
+      /** 来自 backupStatus 的最近一次备份结果。 */
+      const [status, setStatus] = useState(null)
+      /** 来自 backupList 的云端备份列表(新到旧)。 */
+      const [backups, setBackups] = useState(null)
+      const [error, setError] = useState('')
+      // 忙碌计数器:并发操作(如恢复进行中又点保存)共用一个布尔会互相
+      // 提前解锁,危险操作可能在其完成前重新可点。
+      const [busyCount, setBusyCount] = useState(0)
+      const busy = busyCount > 0
+      const beginTask = () => setBusyCount(count => count + 1)
+      const endTask = () => setBusyCount(count => Math.max(0, count - 1))
+      const [saved, setSaved] = useState(false)
+      /** 恢复成功的独立反馈(与"配置已保存"区分,恢复是覆盖性大事件)。 */
+      const [restored, setRestored] = useState(false)
+      /** 待确认恢复的备份文件名;null 表示无待确认项。 */
+      const [confirmRestore, setConfirmRestore] = useState(null)
+      /** 服务端已确认的配置值:失焦时值没变就不发请求,避免路过焦点
+       *  也把密码/加密密钥原样上报一次。 */
+      const confirmed = useRef(null)
+      const mounted = useRef(true)
+      useEffect(() => {
+        mounted.current = true
+        return () => { mounted.current = false }
+      }, [])
+
+      /** 拉取备份状态与云端列表;备份未配置时列表请求会报错,静默保留空列表。 */
+      const refresh = useCallback(async () => {
+        const next = await api('backupStatus')
+        if (!mounted.current) return
+        setStatus(next.status ?? null)
+        try {
+          const list = await api('backupList')
+          if (mounted.current) setBackups(Array.isArray(list.backups) ? list.backups : [])
+        } catch {
+          if (mounted.current) setBackups([])
+        }
+        return next
+      }, [])
+
+      useEffect(() => {
+        if (!open) return undefined
+        let cancelled = false
+        // 先拉配置并校验宿主版本,再决定要不要请求备份状态/列表:
+        // 旧宿主会把这些请求报成"未知动作",不能让它覆盖版本提示。
+        ;(async () => {
+          try {
+            const next = await api('getConfig')
+            if (cancelled) return
+            // 旧版宿主不认识备份配置字段:明确提示需要重载插件,
+            // 而不是渲染一个永远保存失败、重开就"丢配置"的表单。
+            if (next.webdavUrl === undefined) {
+              setError(t('backupVersionMismatch'))
+              return
+            }
+            const loaded = {
+              webdavEnabled: next.webdavEnabled === true,
+              webdavUrl: next.webdavUrl ?? '',
+              webdavUsername: next.webdavUsername ?? '',
+              webdavPassword: next.webdavPassword ?? '',
+              webdavDir: next.webdavDir ?? '',
+              webdavEncryptKey: next.webdavEncryptKey ?? '',
+              webdavDevice: next.webdavDevice ?? '',
+              webdavIntervalMin: next.webdavIntervalMin ?? 60,
+              webdavKeep: next.webdavKeep ?? 5,
+            }
+            confirmed.current = { ...loaded }
+            setValues(loaded)
+            await refresh()
+          } catch (cause) {
+            if (!cancelled) setError(cause?.message ?? String(cause))
+          }
+        })()
+        return () => { cancelled = true }
+      }, [open, refresh])
+
+      /** 保存一个配置补丁;成功后以服务端确认值为准回填全部字段。 */
+      const save = async (patch) => {
+        setError('')
+        setSaved(false)
+        beginTask()
+        try {
+          const next = await api('setConfig', patch)
+          if (!mounted.current) return
+          const merged = {
+            webdavEnabled: next.webdavEnabled === true,
+            webdavUrl: next.webdavUrl ?? '',
+            webdavUsername: next.webdavUsername ?? '',
+            webdavPassword: next.webdavPassword ?? '',
+            webdavDir: next.webdavDir ?? '',
+            webdavEncryptKey: next.webdavEncryptKey ?? '',
+            webdavDevice: next.webdavDevice ?? '',
+            webdavIntervalMin: next.webdavIntervalMin,
+            webdavKeep: next.webdavKeep,
+          }
+          confirmed.current = { ...merged }
+          setValues(merged)
+          setSaved(true)
+        } catch (cause) {
+          if (mounted.current) setError(cause?.message ?? String(cause))
+        } finally {
+          if (mounted.current) endTask()
+        }
+      }
+
+      /** 手动备份:完成后刷新状态与列表。 */
+      const backupNow = async () => {
+        setError('')
+        beginTask()
+        try {
+          await api('backupNow')
+          await refresh()
+        } catch (cause) {
+          if (mounted.current) setError(cause?.message ?? String(cause))
+        } finally {
+          if (mounted.current) endTask()
+        }
+      }
+
+      /** 恢复指定备份:覆盖本地密钥池,成功后刷新状态并通知父面板重拉池数据。 */
+      const restore = async (name) => {
+        setConfirmRestore(null)
+        setError('')
+        setSaved(false)
+        beginTask()
+        try {
+          await api('backupRestore', { file: name })
+          // 池数据已被整体覆盖:刷新备份状态与云端列表,并让父面板重拉,
+          // 否则上方供应商/密钥列表仍显示恢复前的旧数据(审查 P1-1)。
+          await refresh()
+          props.onPoolChanged?.()
+          if (mounted.current) setRestored(true)
+        } catch (cause) {
+          if (mounted.current) setError(cause?.message ?? String(cause))
+        } finally {
+          if (mounted.current) endTask()
+        }
+      }
+
+      const numberInput = (field, min, max) => h('input', {
+        type: 'number',
+        min,
+        max,
+        step: 1,
+        value: values[field],
+        disabled: busy,
+        // 受控组件必须绑 onChange:漏了它输入框打不进任何字符,
+        // 失焦时 Number(旧值)||min 会把值钳回下限,表现为"一改就变 5/1"。
+        onChange: event => setValues(prev => ({ ...prev, [field]: event.target.value })),
+        onBlur: () => {
+          const parsed = Math.min(max, Math.max(min, Math.round(Number(values[field]) || min)))
+          setValues(prev => ({ ...prev, [field]: parsed }))
+          // 值没变(含未编辑过)就不下发:与 textRow 同口径。
+          if (confirmed.current?.[field] !== parsed) save({ [field]: parsed })
+        },
+        style: {
+          width: 64,
+          padding: '3px 6px',
+          fontSize: 12,
+          borderRadius: 6,
+          border: '1px solid var(--dsw-alias-border-secondary, #333)',
+          background: 'var(--dsw-alias-bg-secondary, transparent)',
+          color: 'var(--dsw-alias-fg-primary, inherit)',
+          outline: 'none',
+        },
+      })
+
+      const textRow = (label, field, options = {}) => h('label', {
+        style: { display: 'flex', alignItems: 'center', gap: 8 },
+      },
+      h('span', { style: { flex: 'none', width: 76, opacity: 0.8 } }, label),
+      h(TextField, {
+        value: values[field],
+        placeholder: options.placeholder,
+        type: options.secret ? 'password' : 'text',
+        autoComplete: options.secret ? 'off' : undefined,
+        disabled: busy,
+        onChange: value => setValues(prev => ({ ...prev, [field]: value })),
+        // 失焦时只有相对服务端确认值真正变更过才保存:
+        // 否则每次路过焦点都会把密码/加密密钥原样上报一次。
+        onBlur: () => {
+          const current = values[field]
+          if (current !== null && current !== undefined && current !== confirmed.current?.[field]) {
+            save({ [field]: current })
+          }
+        },
+      }))
+
+      // 最近一次备份的结果行:成功(绿)/失败(红)/从未(灰)。
+      const statusLine = status === null || (status.lastRunAt ?? 0) === 0
+        ? h('div', { style: { opacity: 0.6 } }, t('backupNever'))
+        : status.ok === true
+          ? h('div', { style: { color: '#4caf78' } },
+            `${t('backupLastOk')} ${new Date(status.lastRunAt).toLocaleString()}`
+            + ((status.deletedFailures?.length ?? 0) > 0 ? ` · ${t('backupCleanupWarn')}` : ''))
+          : h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } },
+            `${t('backupLastFail')}: ${status.error ?? t('unknownError')}`)
+
+      const toggle = h('button', {
+        onClick: () => setOpen(value => !value),
+        title: t('backupSettings'),
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '3px 8px',
+          fontSize: 12,
+          borderRadius: 6,
+          border: '1px solid var(--dsw-alias-border-secondary, #333)',
+          background: 'transparent',
+          color: 'var(--dsw-alias-fg-primary, inherit)',
+          cursor: 'pointer',
+        },
+      },
+      h(Icon, { name: 'manage', size: 12 }),
+      h('span', { style: { flex: 1, textAlign: 'left' } }, t('backupSettings')),
+      h(Icon, { name: 'chevron', size: 11 }))
+
+      const children = [toggle, statusLine]
+      if (open) {
+        if (error) {
+          children.push(h('div', { role: 'alert', style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, `${t('error')}: ${error}`))
+        }
+        if (restored) {
+          children.push(h('div', { role: 'status', style: { color: '#4caf78' } }, t('backupRestoredOk')))
+        }
+        if (values === null) {
+          if (error === '') children.push(h('div', { style: { opacity: 0.7 } }, t('loading')))
+        } else {
+          // 开关:定时备份。进行中的操作(尤其恢复)期间禁用,防并发互踩。
+          children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: busy ? 'default' : 'pointer' } },
+            h('input', {
+              type: 'checkbox',
+              checked: values.webdavEnabled === true,
+              disabled: busy,
+              onChange: event => {
+                const checked = event.target.checked
+                setValues(prev => ({ ...prev, webdavEnabled: checked }))
+                save({ webdavEnabled: checked })
+              },
+            }),
+            h('span', null, t('backupEnabled'))))
+          children.push(textRow(t('backupUrl'), 'webdavUrl', { placeholder: 'https://dav.example.com/dav/' }))
+          children.push(textRow(t('backupUsername'), 'webdavUsername'))
+          children.push(textRow(t('backupPassword'), 'webdavPassword', { secret: true }))
+          children.push(textRow(t('backupDir'), 'webdavDir'))
+          children.push(textRow(t('backupEncryptKey'), 'webdavEncryptKey', { secret: true }))
+          children.push(textRow(t('backupDevice'), 'webdavDevice', { placeholder: t('backupDeviceAuto') }))
+          children.push(h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            h('span', { style: { flex: 1, opacity: 0.8 } }, t('backupInterval')),
+            numberInput('webdavIntervalMin', 5, 1440),
+            h('span', { style: { opacity: 0.6 } }, t('backupMinutes'))))
+          children.push(h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            h('span', { style: { flex: 1, opacity: 0.8 } }, t('backupKeep')),
+            numberInput('webdavKeep', 1, 50)))
+          children.push(h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            h('button', {
+              onClick: backupNow,
+              disabled: busy,
+              title: t('backupNowBtn'),
+              style: {
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                padding: '4px 10px',
+                fontSize: 12,
+                borderRadius: 6,
+                border: 'none',
+                background: 'var(--dsw-alias-bg-accent, #4a6cf7)',
+                color: 'var(--dsw-alias-fg-on-accent, #fff)',
+                cursor: busy ? 'default' : 'pointer',
+                opacity: busy ? 0.45 : 1,
+              },
+            }, t('backupNowBtn')),
+            restored ? null : (saved ? h('span', { style: { color: '#4caf78' } }, t('configSaved')) : null)))
+          // 云端备份列表:每行 = 设备 + 时间 + 恢复按钮。
+          children.push(h('div', { style: { borderTop: '1px solid var(--dsw-alias-border-secondary, #333)', paddingTop: 6 } },
+            h('div', { style: { opacity: 0.8, marginBottom: 4 } }, `${t('backupListTitle')}:`),
+            backups === null
+              ? h('div', { style: { opacity: 0.7 } }, t('loading'))
+              : backups.length === 0
+                ? h('div', { style: { opacity: 0.6 } }, t('backupListEmpty'))
+                : backups.map(entry => h('div', {
+                  key: entry.name,
+                  style: {
+                    position: 'relative',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '3px 0',
+                  },
+                },
+                h('span', {
+                  style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                  title: entry.name,
+                }, `${entry.device} · ${new Date(entry.time).toLocaleString()}`),
+                h('div', { style: { flex: 1 } }),
+                confirmRestore === entry.name
+                  ? h(ConfirmPopover, {
+                    message: t('confirmRestore'),
+                    confirmLabel: t('backupRestoreBtn'),
+                    danger: true,
+                    busy,
+                    onConfirm: () => restore(entry.name),
+                    onCancel: () => setConfirmRestore(null),
+                  })
+                  : null,
+                h(IconButton, {
+                  icon: 'use',
+                  title: t('backupRestoreBtn'),
+                  disabled: busy,
+                  onMouseDown: event => event.stopPropagation(),
+                  onClick: () => setConfirmRestore(confirmRestore === entry.name ? null : entry.name),
+                })))))
+        }
+      }
+      return h('div', {
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 6,
+          borderTop: '1px solid var(--dsw-alias-border-secondary, #333)',
+          paddingTop: 8,
+        },
+      }, children)
+    }
+
     /** 设置页 models footer 的入口提示行。 */
     function SettingsHint() {
       return h('div', {
@@ -1636,6 +1987,29 @@ window.__ModuleLoader__.load({
         ok: '确定',
         resetSuffix: '后重置',
         unknownError: '未知错误',
+        backupSettings: 'WebDAV 备份',
+        backupEnabled: '启用定时备份',
+        backupUrl: '服务地址',
+        backupUsername: '账号',
+        backupPassword: '密码',
+        backupDir: '远程目录',
+        backupEncryptKey: '加密密钥',
+        backupDevice: '设备名',
+        backupDeviceAuto: '留空则取主机名',
+        backupInterval: '备份间隔(分钟)',
+        backupKeep: '每设备保留份数',
+        backupNowBtn: '立即备份',
+        backupLastOk: '上次备份成功',
+        backupLastFail: '上次备份失败',
+        backupNever: '尚未备份',
+        backupListTitle: '云端备份',
+        backupListEmpty: '云端还没有备份',
+        backupRestoreBtn: '恢复此版本',
+        confirmRestore: '恢复将覆盖本地全部密钥池,确认继续?',
+        backupCleanupWarn: '部分旧备份清理失败',
+        backupVersionMismatch: '插件宿主半区仍是旧版本,请重载/重装插件后再使用备份功能',
+        backupRestoredOk: '已恢复,上方密钥池已刷新',
+        backupMinutes: '分钟',
       },
       en: {
         buttonLabel: 'Key pool',
@@ -1699,6 +2073,29 @@ window.__ModuleLoader__.load({
         ok: 'OK',
         resetSuffix: 'until reset',
         unknownError: 'Unknown error',
+        backupSettings: 'WebDAV backup',
+        backupEnabled: 'Enable scheduled backup',
+        backupUrl: 'Server URL',
+        backupUsername: 'Username',
+        backupPassword: 'Password',
+        backupDir: 'Remote directory',
+        backupEncryptKey: 'Encryption key',
+        backupDevice: 'Device name',
+        backupDeviceAuto: 'Defaults to hostname',
+        backupInterval: 'Backup interval (minutes)',
+        backupKeep: 'Versions kept per device',
+        backupNowBtn: 'Back up now',
+        backupLastOk: 'Last backup succeeded',
+        backupLastFail: 'Last backup failed',
+        backupNever: 'Never backed up',
+        backupListTitle: 'Cloud backups',
+        backupListEmpty: 'No cloud backups yet',
+        backupRestoreBtn: 'Restore this version',
+        confirmRestore: 'Restoring overwrites the local key pool. Continue?',
+        backupCleanupWarn: 'Some old backups failed to clean up',
+        backupVersionMismatch: 'Plugin host half is outdated; reload or reinstall the plugin to use backup',
+        backupRestoredOk: 'Restored; the key pool above has been refreshed',
+        backupMinutes: 'min',
       },
     }
 
@@ -1753,7 +2150,7 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       apply(ctx) {
         // 构建标记:控制台可确认页面加载的是哪一代客户端代码。
-        console.info('[dsh-key-managment] client build 2026-11-14.1 (mobile-adaptive + remaining-semantics + safe-slot)')
+        console.info('[dsh-key-managment] client build 2026-11-15.2 (confirm-popover-t-fallback + panel-level-safe-slot)')
 
         // 全局错误捕获:任何未捕获异常/拒绝都打上插件标记,便于定位崩溃点。
         ctx.effect(() => {

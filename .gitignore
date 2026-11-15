@@ -6,3 +6,6 @@ node_modules/
 
 # 日志
 *.log
+
+# 本地数据快照(含密钥明文与凭据存储,严禁入库)
+.local-backup-*/

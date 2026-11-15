@@ -1,6 +1,6 @@
 {
   "name": "dsh-key-managment",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "type": "module",
   "description": "Per-provider API key pool with manual switching for DSH providers",
   "repository": {
@@ -15,25 +15,29 @@
     "dsh-plugin"
   ],
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.5"
+    "@deepseek-ai/schemastery": "^3.18.5",
+    "webdav": "^5.11.0"
   },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./backup": "./backup.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "scripts": {
-    "test": "node --test --test-timeout=30000 core.test.mjs quota.test.mjs index.test.mjs timer.test.mjs"
+    "test": "node --test --test-timeout=30000 core.test.mjs quota.test.mjs index.test.mjs timer.test.mjs backup.test.mjs"
   },
   "files": [
     "index.js",
     "core.js",
     "client.js",
+    "backup.js",
     "core.test.mjs",
     "quota.test.mjs",
     "index.test.mjs",
     "timer.test.mjs",
+    "backup.test.mjs",
     "quota-bridge.js",
     "quota/**/*.js",
     "quota/NOTICE.md",
@@ -42,7 +46,9 @@
     "icon.svg"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,

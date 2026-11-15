@@ -14,10 +14,25 @@
  * (零内容阶段识别密钥级/额度级失败后切到下一把可选密钥并重放)。
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
+import { createClient as createWebdavClient } from 'webdav'
 import z from '@deepseek-ai/schemastery'
 import { probeKey } from './quota-bridge.js'
+import {
+  backupsToDelete,
+  backupFileName,
+  buildSnapshot,
+  decryptSnapshot,
+  encryptSnapshot,
+  listBackups,
+  normalizeRestoredSnapshot,
+  parseBackupFileName,
+  planRestore,
+  sanitizeDeviceName,
+  validateBackupConfig,
+} from './backup.js'
 import {
   classifyStreamFailure,
   hitValue,
@@ -62,6 +77,24 @@ export const Config = z.object({
   quotaProbeGapMs: z.number().step(100).min(200).max(60_000).default(5_000).volatile(),
   /** 调用遇密钥失效或额度不足时自动换钥重发(兜底),默认开启。 */
   fallbackOnFailure: z.boolean().default(true).volatile(),
+  /* ---- WebDAV 备份:定时上传加密快照,恢复为手动选版本覆盖 ---- */
+  /** 是否启用定时备份;关闭后仅可手动备份。 */
+  webdavEnabled: z.boolean().default(false).volatile(),
+  /** WebDAV 服务地址,如 https://dav.jianguoyun.com/dav/。 */
+  webdavUrl: z.string().default('').volatile(),
+  webdavUsername: z.string().default('').volatile(),
+  /** WebDAV 密码/应用密码;存本机配置,不上传。 */
+  webdavPassword: z.string().default('').volatile(),
+  /** 远程备份目录(相对服务根),不存在时会尝试创建。 */
+  webdavDir: z.string().default('dsh-key-managment').volatile(),
+  /** 备份加密密钥:多端必须一致,否则解密失败(恢复会被拒绝)。 */
+  webdavEncryptKey: z.string().default('').volatile(),
+  /** 设备名:备份文件名前缀与轮转分组;留空取主机名。 */
+  webdavDevice: z.string().default('').volatile(),
+  /** 定时备份间隔(分钟),下限 5。 */
+  webdavIntervalMin: z.number().step(1).min(5).max(1440).default(60).volatile(),
+  /** 每台设备保留的备份份数,超出删最旧。 */
+  webdavKeep: z.number().step(1).min(1).max(50).default(5).volatile(),
 })
 
 /** 同源 API 路由路径;客户端用同一常量访问。 */
@@ -143,6 +176,12 @@ export function apply(ctx, config) {
   let disposed = false
   /** 配置编辑器;由 ctx.inject 异步补齐。 */
   let configEditor = undefined
+  /** 最近一次备份结果;界面展示"备份了什么时间、成功与否"。 */
+  let backupStatus = { lastRunAt: 0, ok: false, error: null, file: null, deletedFailures: [] }
+  /** 上次定时备份的触发时间;0 表示启动后先补一次。 */
+  let lastBackupAt = 0
+  /** 备份在途标志:上一次未结束时跳过本轮,防止 WebDAV 卡死时无限叠加。 */
+  let backupInFlight = false
 
   /**
    * 初始化:读状态文件 + 读余额快照。
@@ -231,8 +270,12 @@ export function apply(ctx, config) {
   async function readStateFile(path) {
     try {
       return JSON.parse(await readFile(path, 'utf8'))
-    } catch {
-      // 首次运行或文件损坏:normalizeState 会兜底为空状态。
+    } catch (error) {
+      // 首次运行(文件不存在)属正常;文件存在却解析失败说明状态损坏,
+      // 静默吞掉会让后续所有"以磁盘为准"的判断都建立在空态上,必须留痕。
+      if (error?.code !== 'ENOENT') {
+        ctx.logger.warn(`状态文件读取失败(按空状态兜底): ${path}: ${error?.message ?? error}`)
+      }
       return undefined
     }
   }
@@ -945,6 +988,15 @@ export function apply(ctx, config) {
       quotaIntervalMs: live(config, 'quotaIntervalMs', 1_800_000),
       quotaProbeGapMs: live(config, 'quotaProbeGapMs', 5_000),
       fallbackOnFailure: live(config, 'fallbackOnFailure', true),
+      webdavEnabled: live(config, 'webdavEnabled', false),
+      webdavUrl: live(config, 'webdavUrl', ''),
+      webdavUsername: live(config, 'webdavUsername', ''),
+      webdavPassword: live(config, 'webdavPassword', ''),
+      webdavDir: live(config, 'webdavDir', ''),
+      webdavEncryptKey: live(config, 'webdavEncryptKey', ''),
+      webdavDevice: live(config, 'webdavDevice', ''),
+      webdavIntervalMin: live(config, 'webdavIntervalMin', 60),
+      webdavKeep: live(config, 'webdavKeep', 5),
     }
   }
 
@@ -952,7 +1004,7 @@ export function apply(ctx, config) {
   async function writeConfig(patch) {
     // 校验规则放在 core 的纯函数里,与单测共用同一份:
     // 界面按一套规则、宿主按另一套,是最常见的手写校验错位来源。
-    const configError = validateProbeConfig(patch)
+    const configError = validateProbeConfig(patch) ?? validateBackupConfig(patch)
     if (configError !== null) throw new Error(configError)
     const entry = ctx.fiber?.entry
     if (entry === undefined || configEditor === undefined) {
@@ -977,6 +1029,9 @@ export function apply(ctx, config) {
     'refresh',
     // quotaKey 会把探测结论写回健康状态,同样要先以磁盘为准。
     'quotaKey',
+    // 备份会读取磁盘状态上传;恢复会覆盖本地池,两者都必须先以磁盘为准。
+    'backupNow',
+    'backupRestore',
   ])
 
   /**
@@ -1053,6 +1108,16 @@ export function apply(ctx, config) {
       case 'quotaKey':
         if (!provider || !keyId) throw new Error('缺少 provider 或 keyId')
         return quotaOne(provider, keyId, force === true)
+      case 'backupNow':
+        // 手动备份不重置定时节奏;互斥由 runBackup 内部管理。
+        return runBackup()
+      case 'backupList':
+        return remoteBackupList()
+      case 'backupRestore':
+        if (typeof body.file !== 'string' || body.file.length === 0) throw new Error('缺少 file 字段')
+        return restoreBackup(body.file)
+      case 'backupStatus':
+        return { ok: true, status: backupStatus, device: backupDeviceName(), enabled: live(config, 'webdavEnabled', false) === true }
       case 'getConfig':
         return readConfig()
       case 'setConfig':
@@ -1061,6 +1126,15 @@ export function apply(ctx, config) {
           ...(body.quotaIntervalMs !== undefined ? { quotaIntervalMs: body.quotaIntervalMs } : {}),
           ...(body.quotaProbeGapMs !== undefined ? { quotaProbeGapMs: body.quotaProbeGapMs } : {}),
           ...(body.fallbackOnFailure !== undefined ? { fallbackOnFailure: body.fallbackOnFailure } : {}),
+          ...(body.webdavEnabled !== undefined ? { webdavEnabled: body.webdavEnabled } : {}),
+          ...(body.webdavUrl !== undefined ? { webdavUrl: body.webdavUrl } : {}),
+          ...(body.webdavUsername !== undefined ? { webdavUsername: body.webdavUsername } : {}),
+          ...(body.webdavPassword !== undefined ? { webdavPassword: body.webdavPassword } : {}),
+          ...(body.webdavDir !== undefined ? { webdavDir: body.webdavDir } : {}),
+          ...(body.webdavEncryptKey !== undefined ? { webdavEncryptKey: body.webdavEncryptKey } : {}),
+          ...(body.webdavDevice !== undefined ? { webdavDevice: body.webdavDevice } : {}),
+          ...(body.webdavIntervalMin !== undefined ? { webdavIntervalMin: body.webdavIntervalMin } : {}),
+          ...(body.webdavKeep !== undefined ? { webdavKeep: body.webdavKeep } : {}),
         })
       default:
         throw new Error(`未知动作: ${action}`)
@@ -1207,6 +1281,218 @@ export function apply(ctx, config) {
     }, 60_000)
     return () => { clearInterval(timer) }
   }, 'dsh-key-managment: 定时轮换检查')
+
+  /* ------------------------- WebDAV 备份与恢复 ------------------------- */
+
+  /** 设备名:配置优先,留空取主机名;清洗后作为备份文件名前缀与轮转分组。 */
+  function backupDeviceName() {
+    return sanitizeDeviceName(live(config, 'webdavDevice', '') || hostname())
+  }
+
+  /** 读取备份配置并做完整性校验;缺项时抛出明确错误。 */
+  function requireBackupConfig() {
+    const url = String(live(config, 'webdavUrl', '')).trim().replace(/\/+$/, '')
+    const username = String(live(config, 'webdavUsername', '')).trim()
+    const password = String(live(config, 'webdavPassword', ''))
+    const dir = String(live(config, 'webdavDir', '')).trim().replace(/^\/+|\/+$/g, '')
+    const encryptKey = String(live(config, 'webdavEncryptKey', ''))
+    if (!/^https?:\/\//i.test(url)) throw new Error('WebDAV 服务地址未配置或不合法')
+    if (username.length === 0 || password.length === 0) throw new Error('WebDAV 账号或密码未配置')
+    if (encryptKey.length === 0) throw new Error('备份加密密钥未配置')
+    return { url, username, password, dir, encryptKey }
+  }
+
+  /** 组装 WebDAV 客户端与远程路径;每次操作重建以即时跟随配置变化。 */
+  function webdavContext() {
+    const conf = requireBackupConfig()
+    const client = createWebdavClient(conf.url, { username: conf.username, password: conf.password })
+    // 远程路径拼接:目录段已去首尾斜杠,文件名由 parseBackupFileName 保证不含路径分隔符。
+    const remotePath = (name) => `${conf.dir.length > 0 ? `/${conf.dir}` : ''}/${name}`
+    return { ...conf, client, remotePath }
+  }
+
+  /** 备份文件的远程目录;目录名为空时直接用服务根。 */
+  function backupRemoteDir(context) {
+    return context.dir.length > 0 ? `/${context.dir}` : '/'
+  }
+
+  /** 列出远程备份(新到旧);网络/认证错误原样抛出,由调用方呈现。 */
+  async function remoteBackupList() {
+    const context = webdavContext()
+    const contents = await context.client.getDirectoryContents(backupRemoteDir(context))
+    const entries = Array.isArray(contents) ? contents : []
+    const { backups } = listBackups(entries.map(entry => entry.basename ?? entry.filename))
+    return {
+      ok: true,
+      device: backupDeviceName(),
+      backups: backups.map(entry => ({ name: entry.name, device: entry.device, time: entry.timestamp })),
+    }
+  }
+
+  /** 列出目录并按本设备前缀轮转删除超限旧备份;删除失败只记录,不阻断。 */
+  async function rotateRemoteBackups(context) {
+    const keep = Math.max(1, Math.round(Number(live(config, 'webdavKeep', 5)) || 5))
+    const failures = []
+    try {
+      const contents = await context.client.getDirectoryContents(backupRemoteDir(context))
+      const entries = Array.isArray(contents) ? contents : []
+      for (const victim of backupsToDelete(entries.map(entry => entry.basename ?? entry.filename), backupDeviceName(), keep)) {
+        try {
+          await context.client.deleteFile(context.remotePath(victim))
+        } catch (error) {
+          // 权限/只读挂载等场景:本次备份已完成,残留文件下次备份时重试清理。
+          failures.push(`${victim}: ${error?.message ?? error}`)
+        }
+      }
+    } catch (error) {
+      failures.push(`备份列表获取失败(跳过轮转): ${error?.message ?? error}`)
+    }
+    return failures
+  }
+
+  /**
+   * 执行一次备份:以磁盘为准同步 → 构建快照(含密钥明文) → 加密上传 → 轮转。
+   * 结果写入 backupStatus 供界面展示;错误向上抛出,由调用方决定如何记录。
+   *
+   * 互斥:backupInFlight 在本函数内统一管理——定时器与手动 backupNow
+   * 走不同入口,共用这个标志防止两个 runBackup 并发上传/轮转。
+   */
+  async function runBackup() {
+    if (backupInFlight) throw new Error('已有备份在进行中,请稍后再试')
+    backupInFlight = true
+    try {
+      const context = webdavContext()
+      // 与变更动作同理:先以磁盘为准,避免陈旧实例把旧状态备份上去。
+      await syncProvidersFromDisk()
+      const snapshot = await buildSnapshot(state, async (ref) => hitValue(await safeResolve(ref)))
+      // 数据完整性闸门:
+      // - 快照总密钥数为 0 一律拒绝(本地也为空时,空备份没有任何恢复价值,
+      //   反而会以"空快照 + 轮转"逐步挤掉云端的好备份——本功能最初的
+      //   丢数据事故正是这个路径);
+      // - 本地有钥的供应商在快照里变成空池(凭据读取失败的典型症状)同样拒绝。
+      const snapshotKeyTotal = Object.values(snapshot.providers)
+        .reduce((sum, record) => sum + record.keys.length, 0)
+      if (snapshotKeyTotal === 0) {
+        throw new Error('快照中没有任何可备份的密钥,已放弃本次备份以保护云端历史备份')
+      }
+      const starved = Object.values(state.providers)
+        .filter(record => (record.keys?.length ?? 0) > 0)
+        .filter(record => (snapshot.providers[record.provider]?.keys.length ?? 0) === 0)
+        .map(record => record.provider)
+      if (starved.length > 0) {
+        throw new Error(`以下供应商的密钥值读取失败,已放弃本次备份以保护数据: ${starved.join(', ')}`)
+      }
+      const payload = await encryptSnapshot(snapshot, context.encryptKey)
+      const name = backupFileName(backupDeviceName(), new Date())
+      // 逐级创建目录(MKCOL 是单层的,多级目录必须逐段建;已存在等情况报错吞掉):
+      // 例如配置 backup/dsh-keys 而 backup 不存在时,只建最后一级会 409,
+      // 后续 PUT 必然失败,表现为定时备份永远失败。
+      let parent = ''
+      for (const segment of context.dir.split('/').filter(part => part.length > 0)) {
+        parent += `/${segment}`
+        try {
+          await context.client.createDirectory(parent)
+        } catch {
+          // 目录已存在或服务端不支持 MKCOL:继续建下一级。
+        }
+      }
+      await context.client.putFileContents(context.remotePath(name), payload, { overwrite: true })
+      const deletedFailures = await rotateRemoteBackups(context)
+      backupStatus = { lastRunAt: Date.now(), ok: true, error: null, file: name, deletedFailures }
+      if (deletedFailures.length > 0) {
+        ctx.logger.warn(`备份轮转存在未删除的旧备份: ${deletedFailures.join('; ')}`)
+      }
+      return { ok: true, file: name, deletedFailures, ...view() }
+    } finally {
+      backupInFlight = false
+    }
+  }
+
+  /**
+   * 从指定备份恢复:下载 → 解密(失败即中止,不触碰本地) → 生成恢复计划
+   * → 写凭据、重建 providers → 落盘。任何一步失败都不改变本地状态。
+   */
+  async function restoreBackup(name) {
+    const parsed = parseBackupFileName(name)
+    if (parsed === null) throw new Error('备份文件名不合法')
+    const context = webdavContext()
+    const raw = await context.client.getFileContents(context.remotePath(parsed.name), { format: 'binary' })
+    const buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
+    const snapshot = normalizeRestoredSnapshot(await decryptSnapshot(buffer, context.encryptKey))
+    if (snapshot === null) throw new Error('备份内容结构无效,已中止恢复')
+    // 恢复侧闸门:快照里没有任何密钥时拒绝恢复——覆盖一个空快照只会
+    // 把本地数据清空,没有任何恢复价值。
+    const snapshotKeyTotal = Object.values(snapshot.providers)
+      .reduce((sum, record) => sum + record.keys.length, 0)
+    if (snapshotKeyTotal === 0) {
+      throw new Error('备份里没有可恢复的密钥,已中止恢复')
+    }
+    // 恢复前先以磁盘为准:计划基于最新状态生成,孤儿引用才清得干净。
+    await syncProvidersFromDisk()
+    const plan = planRestore(snapshot, state.providers, provider => newPoolRef(provider))
+    // 先写后清:写失败时本地池还是旧值,不会出现"引用清了值没写上"的半态。
+    // 补偿:写入中途失败时,已写入的新引用会成为状态文件里没有的孤儿明文,
+    // 必须尽力清理;persist 失败同理(状态未落盘,新引用同样是孤儿)。
+    const appliedRefs = []
+    try {
+      for (const entry of plan.refsToSet) {
+        await ctx.credentials.set(entry.ref, entry.value)
+        appliedRefs.push(entry.ref)
+      }
+      for (const ref of plan.refsToUnset) {
+        try {
+          await ctx.credentials.unset(ref)
+        } catch {
+          // 与 deleteKey 同理:状态文件已不含该引用,残留凭据无害。
+        }
+      }
+      state.providers = plan.providers
+      await persist()
+    } catch (error) {
+      for (const ref of appliedRefs) {
+        try { await ctx.credentials.unset(ref) } catch { /* 尽力清理 */ }
+      }
+      throw error
+    }
+    for (const warning of plan.warnings) ctx.logger.warn(`恢复备份: ${warning}`)
+    ctx.logger.info(`已从备份 ${parsed.name} 恢复 ${Object.keys(plan.providers).length} 个供应商的密钥池`)
+    return { ok: true, restored: Object.keys(plan.providers).length, warnings: plan.warnings, ...view() }
+  }
+
+  // 定时备份:每分钟检查一次,距上次触发满配置间隔即备份一次。
+  // 间隔下限 5 分钟(schema 强制);互斥由 runBackup 内的 backupInFlight 统一管理。
+  // 必须经 mutationTail 派发:绕过队列会与 restoreBackup 等变更动作真并发,
+  // 在恢复中途做 sync/上传,可能产出半恢复态的快照。
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      if (disposed) return
+      if (live(config, 'webdavEnabled', false) !== true) return
+      const intervalMin = Math.max(5, Number(live(config, 'webdavIntervalMin', 60)) || 60)
+      const now = Date.now()
+      if (now - lastBackupAt < intervalMin * 60_000) return
+      lastBackupAt = now
+      // 先等启动闸门:重载后立刻抢跑会在凭据服务就绪前构建出空快照
+      // (runBackup 的完整性闸门会兜底拒绝,但不能只依赖它)。
+      void startupReady.then(() => {
+        if (disposed) return
+        // 失败只回退约 1 分钟:下次 tick 即重试;持续失败(如配置错误)时
+        // 每次尝试都会重新排到一分钟后,不会形成无间隔风暴。
+        const scheduledAt = lastBackupAt
+        return mutationTail
+          .catch(() => {})
+          .then(() => runBackup())
+          .catch((error) => {
+            lastBackupAt = Math.min(scheduledAt + intervalMin * 60_000, Date.now() - intervalMin * 60_000 + 60_000)
+            backupStatus = {
+              lastRunAt: Date.now(), ok: false,
+              error: error?.message ?? String(error), file: null, deletedFailures: [],
+            }
+            ctx.logger.warn(`定时备份失败: ${error?.message ?? error}`)
+          })
+      })
+    }, 60_000)
+    return () => { clearInterval(timer) }
+  }, 'dsh-key-managment: WebDAV 定时备份')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
