@@ -39,7 +39,7 @@ import {
   isFallbackFailureChunk,
   isSelectable,
   isStreamContentChunk,
-  MAX_KEYS_PER_PROVIDER,
+  MAX_ALIAS_LENGTH,
   QUOTA_COOLDOWN_MS,
   digestOf,
   findKeyByDigest,
@@ -779,9 +779,6 @@ export function apply(ctx, config) {
     if (keyError !== null) return keyError
     const aliasError = validateAlias(alias)
     if (aliasError !== null) return aliasError
-    if (record.keys.length >= MAX_KEYS_PER_PROVIDER) {
-      return `密钥池已满(上限 ${MAX_KEYS_PER_PROVIDER} 把)`
-    }
     const digest = digestOf(value)
     if (existingDigests !== undefined) {
       if (existingDigests.has(digest)) return '该密钥已在池内'

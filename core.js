@@ -15,9 +15,6 @@ export const MAX_KEY_LENGTH = 4096
 /** 别名长度上限,与参考实现的体验一致。 */
 export const MAX_ALIAS_LENGTH = 80
 
-/** 单个供应商密钥池容量上限,防止误粘贴造成无界增长。 */
-export const MAX_KEYS_PER_PROVIDER = 50
-
 /** 生成一个非敏感的密钥记录 id。 */
 export function newKeyId() {
   return `k_${randomBytes(6).toString('hex')}`
