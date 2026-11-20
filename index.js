@@ -53,7 +53,9 @@ import {
   parseAction,
   parseBatchEntries,
   pickNextKeyId,
-  probeRoundDelay,
+  buildProbeQueue,
+  pickProbeTarget,
+  requeueProbe,
   projectProvider,
   settleKeyHealth,
   shouldRotateCalls,
@@ -71,10 +73,8 @@ export const inject = ['llm', 'credentials', 'webServer']
 export const Config = z.object({
   /** 是否启用密钥余额探测(探测关闭时界面只展示历史快照)。 */
   quotaProbe: z.boolean().default(true).volatile(),
-  /** 后台探测轮间隔(毫秒),默认 30 分钟。 */
-  quotaIntervalMs: z.number().step(60_000).min(60_000).max(86_400_000).default(1_800_000).volatile(),
-  /** 一轮内相邻两次厂商调用之间的间隔(毫秒),默认 5 秒,限流友好。 */
-  quotaProbeGapMs: z.number().step(100).min(200).max(60_000).default(5_000).volatile(),
+  /** 公平调度探测间隔(秒):上一次探测结束后等待的秒数,默认 10 秒。 */
+  fairProbeIntervalSec: z.number().step(1).min(1).max(3600).default(10).volatile(),
   /** 调用遇密钥失效或额度不足时自动换钥重发(兜底),默认开启。 */
   fallbackOnFailure: z.boolean().default(true).volatile(),
   /* ---- WebDAV 备份:定时上传加密快照,恢复为手动选版本覆盖 ---- */
@@ -170,8 +170,13 @@ export function apply(ctx, config) {
   const quotaInflight = new Map()
   /** 余额快照的持久化文件路径:与状态文件分开,避免互相干扰。 */
   const quotaPath = join(dirname(statePath), 'key-managment-quota.json')
-  /** 后台探测轮的运行标志:防止上一轮未结束时叠加新一轮。 */
-  let backgroundProbing = false
+  /**
+   * 公平调度探测队列(内存态):探测完成回队尾,新纳管密钥插队首,
+   * 被删除的密钥在调度时剔除;重启后由探测循环按状态文件顺序重建。
+   */
+  const probeQueue = []
+  /** 公平调度正在探测的目标:供界面状态行展示"正在检查哪把密钥"。 */
+  let probeStatus = null
   /** 实例是否已被卸载:卸载后不再探测与落盘,避免旧实例覆盖新实例的状态。 */
   let disposed = false
   /** 配置编辑器;由 ctx.inject 异步补齐。 */
@@ -393,80 +398,156 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 后台探测一轮:串行扫全部纳管供应商,组内间隔 quotaProbeGapMs。
-   * 由定时器驱动;上一轮未结束时不叠加;探测开着才跑。
+   * 探测一把密钥并落定健康状态(公平调度循环的探测单元)。
+   *
+   * 与整轮扫描时代不同,这里每把探完即落盘:循环节奏是"探一把 → 等 n 秒",
+   * 再攒一整轮的状态一起写,一次卸载就可能丢掉几十秒的探测结论。
+   * record/key 都取活对象:探测的 await 期间定时同步可能已整体替换
+   * state.providers,写进旧引用的结论会随落盘丢失(原审查 P0-1/P0-2)。
    */
-  async function backgroundPass() {
-    if (backgroundProbing) return
+  async function probeOne(provider, keyId) {
+    const record = recordOf(provider)
+    if (record === undefined) return
+    const key = record.keys.find(entry => entry?.id === keyId)
+    if (key === undefined) return
+    const profile = profileOf(record.provider)
+    // force=true:后台调度是唯一刷新通道,不受 TTL 短路。
+    const payload = await probeKey(ctx, record, key, profile, quotaStore, quotaInflight, true)
+    // 卸载后放弃落盘:旧实例不得覆盖新实例已写好的文件。
     if (disposed) return
-    if (live(config, 'quotaProbe', true) !== true) return
-    backgroundProbing = true
-    try {
-      const gapMs = live(config, 'quotaProbeGapMs', 5_000)
-      let stateDirty = false
-      let first = true
-      for (const listed of Object.values(state.providers)) {
-        // 卸载后放弃本轮:继续探测并落盘会把旧实例的状态覆盖到新实例上。
-        if (disposed) return
-        // 每轮按 provider 重新取活记录:dispatch 与定时同步都会替换
-        // state.providers,持有旧对象会让健康写静默丢失(审查 P0-1)。
-        const record = recordOf(listed.provider)
-        if (record === undefined) continue
-        const profile = profileOf(record.provider)
-        // 待探列表也取活对象:一轮要探几分钟,期间的同步会换掉密钥集合,
-        // 按旧快照遍历会探到已删除的密钥,残留快照还会被写回余额缓存。
-        for (const key of [...record.keys]) {
-          // 卸载后立即放弃本轮:组内间隔动辄数秒,只在 provider 边界检查不够——
-          // 继续探测并落盘会把旧实例的状态覆盖到新实例已经写好的文件上。
-          if (disposed) return
-          if (!first) await new Promise(resolve => setTimeout(resolve, gapMs))
-          first = false
-          // force=true:后台轮的目标就是刷新,不被 TTL 短路。
-          const payload = await probeKey(ctx, record, key, profile, quotaStore, quotaInflight, true)
-          // 探测结果推导健康状态:有效/限流/无效,轮换时据此跳过。
-          // 按 id 写回当前内存态的活对象:一轮要探几分钟,期间定时同步
-          // 会整体替换 state.providers,写进旧引用的结论会随落盘丢失。
-          const settled = settleKeyHealth(state.providers, record.provider, key.id, payload, Date.now())
-          if (settled.changed) {
-            stateDirty = true
-          }
-        }
+    const settled = settleKeyHealth(state.providers, record.provider, key.id, payload, Date.now())
+    // 密钥可能在探测的 await 期间被删除:删除路径先清过一次快照,
+    // 但晚于本次 probeKey 的写入,这里按活池子复核,避免孤儿条目
+    // 随快照文件永久残留(公平调度永不停,命中概率远高于整轮扫描时代)。
+    if (liveKeyOf(record.provider, key.id) === undefined) {
+      quotaStore.delete(`${record.provider}\u0000${key.id}`)
+    }
+    if (settled.changed) await persist()
+    await persistQuota()
+  }
+
+  /** 公平调度探测间隔(毫秒):每轮现读配置,改间隔下一轮即生效;非法值回落 10 秒。 */
+  function fairProbeGapMs() {
+    const seconds = Number(live(config, 'fairProbeIntervalSec', 10))
+    return Math.max(1, Number.isFinite(seconds) ? Math.round(seconds) : 10) * 1000
+  }
+
+  /**
+   * 下一轮探测的排程时刻(毫秒时间戳):每次进入间隔等待前写入,
+   * 供界面状态行做倒计时;0 表示未排程(开关关闭/正在探测中)。
+   */
+  let probeNextAt = 0
+
+  /**
+   * 预览下一个将被调度的目标(不改动真实队列)。
+   *
+   * pickProbeTarget 会原位修改队列,这里在浅拷贝上试选:
+   * 不可选的密钥会被跳过,得到的就是"如果现在出发,先探哪把"。
+   */
+  function peekNextTarget() {
+    const { target } = pickProbeTarget([...probeQueue], state.providers, Date.now())
+    return target
+  }
+
+  /** 按目标解析展示名与别名;密钥已被删除时返回 undefined。 */
+  function targetView(target) {
+    if (target === undefined) return undefined
+    const record = recordOf(target.provider)
+    const key = record !== undefined && Array.isArray(record.keys)
+      ? record.keys.find(entry => entry?.id === target.keyId)
+      : undefined
+    if (record === undefined || key === undefined) return undefined
+    return { provider: record.provider, displayName: record.displayName, alias: key.alias }
+  }
+
+  /**
+   * 状态行视图:正在探测的密钥、下一个待调度的密钥与倒计时基准。
+   *
+   * next/nextAt 让"探测间隙"也有的看:探测本身不到一秒,间隔等待占
+   * 绝大部分时间,只显示"正在探测"会几乎一直是空闲。
+   * now 随回包下发,客户端用它抵消与本机的时钟偏差,倒计时才准。
+   * 全部只读活对象:密钥或供应商被删时对应字段按空返回,不给陈旧名字。
+   */
+  function probeStatusView() {
+    const now = Date.now()
+    const current = probeStatus
+    const enabled = live(config, 'quotaProbe', true) === true
+    let probing
+    if (current !== null) {
+      const record = recordOf(current.provider)
+      const key = record !== undefined && Array.isArray(record.keys)
+        ? record.keys.find(entry => entry?.id === current.keyId)
+        : undefined
+      if (record !== undefined && key !== undefined) {
+        probing = { provider: record.provider, displayName: record.displayName, alias: key.alias }
       }
-      // 落盘前再确认一次:卸载后不再用旧内存态覆盖新实例已写入的文件。
-      if (disposed) return
-      await persistQuota()
-      if (stateDirty) await persist()
-    } catch (error) {
-      ctx.logger.warn(`后台余额探测失败: ${error?.message ?? error}`)
-    } finally {
-      backgroundProbing = false
+    }
+    return {
+      ok: true,
+      probing: probing ?? null,
+      // 开关关闭时调度器不会发起探测,"下一把"按空返回,界面才不会
+      // 显示一个永远不会发生的排程。
+      next: enabled ? targetView(peekNextTarget()) ?? null : null,
+      nextAt: enabled ? probeNextAt : 0,
+      now,
+      enabled,
+      queued: probeQueue.length,
     }
   }
 
-  // 后台定时探测:启动即探一轮,之后每轮开始重读配置
-  // (改间隔下一轮即生效,默认 30 分钟)。
+  // 公平调度后台探测:启动就绪即持续运行,探测开关开启期间永不停止。
+  // 节奏是"探一把 → 等 n 秒 → 探下一把"(间隔从上次探测结束后起算),
+  // 而不是整轮扫描后一次大等待;开关关闭时低频轮询配置,热生效。
   ctx.effect(() => {
     let stopped = false
-    // 挂起的等待定时器:卸载时要一并取消,否则进程会多等一个轮间隔
-    // (默认 30 分钟)才退出——清理函数只置停止标志取消不了它。
+    // 挂起的等待定时器:卸载时要一并取消,否则进程会多等一个间隔才退出。
     let pending = undefined
+    const sleep = ms => new Promise(resolve => {
+      pending = setTimeout(resolve, ms)
+    }).then(() => { pending = undefined })
     void (async () => {
       // 等状态读盘 + 首次扫描结束再开跑:否则探测拿不到供应商 profile。
       await startupReady
-      if (stopped) return
-      let round = 0
+      if (stopped || disposed) return
+      // 队列不落盘:每次启动按状态文件中已纳管供应商顺序重建。
+      probeQueue.length = 0
+      probeQueue.push(...buildProbeQueue(state.providers))
       while (!stopped) {
-        // 第 0 轮不等待:进程刚起来立刻探一次,之后才按间隔轮转。
-        const delayMs = probeRoundDelay(round, live(config, 'quotaIntervalMs', 1_800_000))
-        if (delayMs > 0) {
-          await new Promise(resolve => {
-            pending = setTimeout(resolve, delayMs)
-          })
-          pending = undefined
-          if (stopped) break
+        if (disposed) return
+        if (live(config, 'quotaProbe', true) !== true) {
+          // 开关关闭:低频轮询配置,重新开启后立即恢复调度;状态行同步清空,
+          // 下一次探测时刻未知,置 0 让界面不显示倒计时。
+          probeStatus = null
+          probeNextAt = 0
+          await sleep(5_000)
+          continue
         }
-        await backgroundPass()
-        round += 1
+        const { target, exhausted } = pickProbeTarget(probeQueue, state.providers, Date.now())
+        if (exhausted) {
+          // 全池不可探(空池/全部 invalid/全部冷却中):休眠一个间隔再扫,
+          // 不得空转打满 CPU;冷却到期后密钥自然恢复参选。
+          probeStatus = null
+          probeNextAt = Date.now() + fairProbeGapMs()
+          await sleep(fairProbeGapMs())
+          continue
+        }
+        // 标记当前正在探测的密钥:界面的状态行据此实时展示进度。
+        probeStatus = { provider: target.provider, keyId: target.keyId, startedAt: Date.now() }
+        probeNextAt = 0
+        try {
+          await probeOne(target.provider, target.keyId)
+        } catch (error) {
+          ctx.logger.warn(`后台余额探测失败: ${error?.message ?? error}`)
+        } finally {
+          // 无论成败,这把已探完:状态行不得滞留在上一把上。
+          probeStatus = null
+        }
+        // 卸载后不再回队与等待:立即退出循环。
+        if (stopped || disposed) return
+        requeueProbe(probeQueue, state.providers, target)
+        // 记录下一轮时刻再睡:界面状态行据此显示倒计时。
+        probeNextAt = Date.now() + fairProbeGapMs()
+        await sleep(fairProbeGapMs())
       }
     })()
     return () => {
@@ -476,7 +557,7 @@ export function apply(ctx, config) {
         pending = undefined
       }
     }
-  }, 'dsh-key-managment: 后台余额探测定时器')
+  }, 'dsh-key-managment: 公平调度探测循环')
 
   /**
    * 扫描 llm 目录 + settings 命名空间:
@@ -526,7 +607,10 @@ export function apply(ctx, config) {
     const ref = newPoolRef(provider)
     await ctx.credentials.set(ref, value)
     const record = newProviderRecord(found.provider, found.displayName, found.settingsNs, found.keyRef)
-    record.keys = [{ id: newKeyId(), alias: 'Key_1', ref, createdAt: Date.now(), lastUsedAt: Date.now(), health: 'unknown', cooldownUntil: 0 }]
+    const firstKey = { id: newKeyId(), alias: 'Key_1', ref, createdAt: Date.now(), lastUsedAt: Date.now(), health: 'unknown', cooldownUntil: 0 }
+    record.keys = [firstKey]
+    // 新纳管的供应商插公平调度队列队首:下一次调度立即探测。
+    probeQueue.unshift({ provider, keyId: firstKey.id })
     // 当前生效的就是这把。
     record.activeKeyId = record.keys[0].id
     record.lastRotatedAt = Date.now()
@@ -797,13 +881,16 @@ export function apply(ctx, config) {
     // push 进旧数组等于没加——活池子里没这把,凭据却留在凭据库成了无主明文。
     // 按 provider 回查活记录再写入。
     const liveRecord = requireRecord(record.provider)
+    const newId = newKeyId()
     liveRecord.keys.push({
-      id: newKeyId(),
+      id: newId,
       alias: alias?.trim() || nextAlias(liveRecord.keys),
       ref,
       createdAt: Date.now(),
       lastUsedAt: 0,
     })
+    // 新密钥插公平调度队列的队首:下一次调度立即探测它。
+    probeQueue.unshift({ provider: liveRecord.provider, keyId: newId })
     return null
   }
 
@@ -982,8 +1069,7 @@ export function apply(ctx, config) {
     return {
       ok: true,
       quotaProbe: live(config, 'quotaProbe', true),
-      quotaIntervalMs: live(config, 'quotaIntervalMs', 1_800_000),
-      quotaProbeGapMs: live(config, 'quotaProbeGapMs', 5_000),
+      fairProbeIntervalSec: live(config, 'fairProbeIntervalSec', 10),
       fallbackOnFailure: live(config, 'fallbackOnFailure', true),
       webdavEnabled: live(config, 'webdavEnabled', false),
       webdavUrl: live(config, 'webdavUrl', ''),
@@ -1117,11 +1203,12 @@ export function apply(ctx, config) {
         return { ok: true, status: backupStatus, device: backupDeviceName(), enabled: live(config, 'webdavEnabled', false) === true }
       case 'getConfig':
         return readConfig()
+      case 'probeStatus':
+        return probeStatusView()
       case 'setConfig':
         return writeConfig({
           ...(body.quotaProbe !== undefined ? { quotaProbe: body.quotaProbe } : {}),
-          ...(body.quotaIntervalMs !== undefined ? { quotaIntervalMs: body.quotaIntervalMs } : {}),
-          ...(body.quotaProbeGapMs !== undefined ? { quotaProbeGapMs: body.quotaProbeGapMs } : {}),
+          ...(body.fairProbeIntervalSec !== undefined ? { fairProbeIntervalSec: body.fairProbeIntervalSec } : {}),
           ...(body.fallbackOnFailure !== undefined ? { fallbackOnFailure: body.fallbackOnFailure } : {}),
           ...(body.webdavEnabled !== undefined ? { webdavEnabled: body.webdavEnabled } : {}),
           ...(body.webdavUrl !== undefined ? { webdavUrl: body.webdavUrl } : {}),

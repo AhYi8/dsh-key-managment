@@ -107,10 +107,10 @@ function apiOf(ctx, disposers, config = {}) {
   let handler
   const original = ctx.webServer.register
   ctx.webServer.register = (entry) => { handler = entry.handler }
-  // quotaProbe:false —— 后台探测不跑,免得测试真的去请求厂商接口。
-  // 测试跑在 node --test --test-force-exit 下:插件的后台探测用 setTimeout
-  // 轮转,它的清理函数只置停止标志、不取消挂起的定时器,进程会多等一个轮间隔。
-  apply(ctx, { quotaProbe: false, quotaIntervalMs: 3_600_000, quotaProbeGapMs: 200, ...config })
+  // quotaProbe:false —— 后台公平调度不探测,免得测试真的去请求厂商接口。
+  // 测试跑在 node --test --test-force-exit 下:探测循环的清理函数会取消
+  // 挂起的定时器,这里关掉探测只是避免假凭据打出真实网络请求。
+  apply(ctx, { quotaProbe: false, fairProbeIntervalSec: 3600, ...config })
   ctx.webServer.register = original
 
   return async (body) => {
@@ -166,6 +166,28 @@ test('index.js:纳管后可添加密钥,切换后原引用值随之替换', asyn
     assert.equal(switched.ok, true)
     assert.equal(credentials.get('MINIMAX_CN_API_KEY'), 'sk-second')
     assert.equal(switched.providers[0].activeKeyId, second.id)
+  })
+})
+
+test('index.js:probeStatus 返回空闲与队列剩余数(探测关闭时无在探目标)', async () => {
+  await withTempProfile(async (dir, disposers) => {
+    const { ctx, credentials } = mockCtx(disposers)
+    withAdoptableProvider(ctx, credentials)
+    // apiOf 默认 quotaProbe:false:后台调度不跑,probeStatus 必然是空闲。
+    const api = apiOf(ctx, disposers)
+    await api({ action: 'adoptProvider', provider: 'minimax-cn' })
+    await api({ action: 'addKey', provider: 'minimax-cn', value: 'sk-second' })
+
+    const status = await api({ action: 'probeStatus' })
+    assert.equal(status.ok, true)
+    assert.equal(status.probing, null)
+    // 队列在启动时按状态文件顺序重建:池内两把 → 剩余 2。
+    assert.equal(status.queued, 2)
+    // 探测关闭:下一把未排程(空),倒计时基准为 0;now 供客户端抵消时钟偏差。
+    assert.equal(status.next, null)
+    assert.equal(status.nextAt, 0)
+    assert.equal(status.enabled, false)
+    assert.equal(typeof status.now, 'number')
   })
 })
 

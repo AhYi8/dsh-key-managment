@@ -224,8 +224,7 @@ export function mergeRuntimeState(memoryProviders, freshProviders) {
  */
 export const PROBE_CONFIG_RULES = {
   quotaProbe: { type: 'boolean' },
-  quotaIntervalMs: { min: 60_000, max: 86_400_000, step: 60_000, stepHint: '(整分钟)' },
-  quotaProbeGapMs: { min: 200, max: 60_000, step: 100 },
+  fairProbeIntervalSec: { min: 1, max: 3600, step: 1 },
 }
 
 /** 校验一个数字型配置字段;返回错误消息(null 表示通过)。 */
@@ -245,7 +244,7 @@ function checkNumberRule(name, value, rule) {
 /**
  * 校验探测配置补丁;返回错误消息(null 表示通过)。
  *
- * @param patch 待校验的补丁,如 { quotaIntervalMs: 90000 }
+ * @param patch 待校验的补丁,如 { fairProbeIntervalSec: 10 }
  */
 export function validateProbeConfig(patch) {
   if (patch === null || typeof patch !== 'object') return '配置补丁必须是对象'
@@ -255,10 +254,8 @@ export function validateProbeConfig(patch) {
   if (patch.fallbackOnFailure !== undefined && typeof patch.fallbackOnFailure !== 'boolean') {
     return 'fallbackOnFailure 必须是布尔值'
   }
-  const intervalError = checkNumberRule('quotaIntervalMs', patch.quotaIntervalMs, PROBE_CONFIG_RULES.quotaIntervalMs)
+  const intervalError = checkNumberRule('fairProbeIntervalSec', patch.fairProbeIntervalSec, PROBE_CONFIG_RULES.fairProbeIntervalSec)
   if (intervalError !== null) return intervalError
-  const gapError = checkNumberRule('quotaProbeGapMs', patch.quotaProbeGapMs, PROBE_CONFIG_RULES.quotaProbeGapMs)
-  if (gapError !== null) return gapError
   return null
 }
 
@@ -627,20 +624,78 @@ export function shouldRotateInterval(rotation, lastRotatedAt, now) {
 /* --------------------------- 后台探测调度 --------------------------- */
 
 /**
- * 后台探测的轮次节奏:第 0 轮(启动首探)立即执行,之后每轮等待 intervalMs。
+ * 公平调度探测队列:按已纳管供应商顺序展开为待探目标列表。
  *
- * 把"启动立即"表达成 0 延迟而不是拆成两段循环:轮次序号本身就是调度
- * 策略,单测可以直接断言首轮不等待。
+ * 队列是内存态:探测完成的密钥回到队尾,新纳管的密钥插队首,
+ * 被删除的密钥在调度时剔除——磁盘上不落队列,重启后按状态文件
+ * 顺序重建即可,顺序本身没有持久化价值。
  *
- * @param round 已完成的轮次序号(启动首探之前为 0)
- * @param intervalMs 配置的轮间隔(毫秒)
- * @returns 距下一轮开始的等待毫秒数(0 表示立即执行)
+ * @param providers 状态里的供应商集合(state.providers)
+ * @returns {{provider: string, keyId: string}[]} 初始队列(队首在前)
  */
-export function probeRoundDelay(round, intervalMs) {
-  if (!Number.isFinite(round) || round <= 0) return 0
-  const value = Number.isFinite(intervalMs) ? Math.round(intervalMs) : 0
-  // 下限 1 分钟:配置写坏时也不能把厂商端点打成轮询风暴。
-  return Math.max(60_000, value)
+export function buildProbeQueue(providers) {
+  const queue = []
+  if (providers === null || typeof providers !== 'object') return queue
+  for (const record of Object.values(providers)) {
+    if (record === null || typeof record !== 'object' || !Array.isArray(record.keys)) continue
+    for (const key of record.keys) {
+      if (key === null || typeof key !== 'object' || typeof key.id !== 'string') continue
+      queue.push({ provider: record.provider, keyId: key.id })
+    }
+  }
+  return queue
+}
+
+/**
+ * 从队首选出下一个可探测的目标(原位修改队列)。
+ *
+ * - 密钥已被删除(凭据无主):从队列剔除,继续找下一个;
+ * - 密钥不可选(isSelectable 为假:invalid 或冷却中):移到队尾跳过,
+ *   不消耗探测等待;
+ * - 整条队列扫完都没有可探目标(全池 invalid/冷却中/空池):
+ *   返回 exhausted,让宿主休眠一轮再扫,避免空转打满 CPU。
+ *
+ * @param queue 探测队列(原位修改)
+ * @param providers 当前内存态的供应商集合
+ * @param now 当前时间戳
+ * @returns {{target?: {provider, keyId}, exhausted?: boolean}}
+ */
+export function pickProbeTarget(queue, providers, now) {
+  if (!Array.isArray(queue)) return { exhausted: true }
+  let scanned = 0
+  while (scanned < queue.length) {
+    const target = queue.shift()
+    const record = target !== undefined ? providers?.[target.provider] : undefined
+    const key = record !== undefined && Array.isArray(record.keys)
+      ? record.keys.find(entry => entry?.id === target.keyId)
+      : undefined
+    if (record === undefined || key === undefined) {
+      // 密钥或整个供应商已被删除:不回队,队列长度收缩。
+      continue
+    }
+    if (!isSelectable(key, now)) {
+      // 不可选:移到队尾,下次轮到时若已过冷却即可参与调度。
+      queue.push(target)
+      scanned += 1
+      continue
+    }
+    return { target }
+  }
+  // 扫描数等于队列长度:剩下的全是本轮不可选的密钥,已全部移回队尾。
+  return { exhausted: true }
+}
+
+/**
+ * 探测完成后把目标追加到队尾,继续参与公平调度。
+ * 密钥可能在探测期间被删除:此时队里已无此目标,追加即重复探测,
+ * 因此按 provider+keyId 校验仍存在才回队。
+ */
+export function requeueProbe(queue, providers, target) {
+  if (!Array.isArray(queue) || target === null || typeof target !== 'object') return
+  const record = providers?.[target.provider]
+  if (record === undefined || !Array.isArray(record.keys)) return
+  if (!record.keys.some(entry => entry?.id === target.keyId)) return
+  queue.push({ provider: target.provider, keyId: target.keyId })
 }
 
 /**

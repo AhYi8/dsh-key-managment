@@ -5,7 +5,7 @@
  *   自定义供应商下拉(含取消纳管)、密钥列表(无边框图标按钮,
  *   每行按钮组最左侧圆环余额,tooltip 式明细弹层带立即刷新,
  *   删除走 tooltip 式二次确认)、添加密钥、刷新扫描、可纳管常驻区、
- *   后台探测设置(探测开关 + 轮间隔 + 组内间隔,折叠在面板底部);
+ *   后台探测设置(探测开关 + 探测间隔,折叠在面板底部);
  * - 设置页供应商卡片注册"已纳入管理"徽标。
  *
  * 数据走 Host 半区的同源 HTTP 路由(POST JSON),不引宿主 UI 原语包,
@@ -1365,17 +1365,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 组内间隔按 100 毫秒取整:schema 限定步长为 100,
-     * 用户填 250 这类值会被宿主拒掉并弹出未翻译的英文报错。
-     */
-    function snapProbeGap(value) {
-      const number = Number(value)
-      if (!Number.isFinite(number)) return 200
-      return Math.min(60_000, Math.max(200, Math.round(number / 100) * 100))
-    }
-
-    /**
-     * 后台探测设置(收在悬浮框内):探测开关 + 轮间隔 + 组内间隔。
+     * 后台探测设置(收在悬浮框内):探测开关 + 探测间隔(秒)。
      * 默认折叠:悬浮框主体是密钥列表,探测配置属于低频操作。
      */
     function ProbeConfigSection() {
@@ -1383,6 +1373,12 @@ window.__ModuleLoader__.load({
       const [values, setValues] = useState(null)
       const [error, setError] = useState('')
       const [saved, setSaved] = useState(false)
+      /** probeStatus 动作的回包:正在探测的密钥、下一把待调度密钥与倒计时基准。 */
+      const [probeNow, setProbeNow] = useState(null)
+      /** 回包到达的本机时刻:与回包里的服务端时刻相减,抵消时钟偏差。 */
+      const fetchedAtRef = useRef(0)
+      /** 每秒自增的时钟:驱动倒计时文案重算,而不依赖轮询节奏。 */
+      const [, setTickClock] = useState(0)
       const mounted = useRef(true)
       // 已落盘确认过的值:与它相同的补丁不再下发——
       // 每次 setConfig 都会写 profile patch 并触发 Loader 复核,徒增重载。
@@ -1407,20 +1403,48 @@ window.__ModuleLoader__.load({
             if (cancelled) return
             confirmed.current = {
               quotaProbe: next.quotaProbe === true,
-              quotaIntervalMs: next.quotaIntervalMs,
-              quotaProbeGapMs: next.quotaProbeGapMs,
+              fairProbeIntervalSec: secOr10(next.fairProbeIntervalSec),
               fallbackOnFailure: next.fallbackOnFailure !== false,
             }
             setValues({
               quotaProbe: next.quotaProbe,
-              quotaIntervalMs: next.quotaIntervalMs,
-              quotaProbeGapMs: next.quotaProbeGapMs,
+              fairProbeIntervalSec: secOr10(next.fairProbeIntervalSec),
               fallbackOnFailure: next.fallbackOnFailure !== false,
             })
           })
           .catch(cause => { if (!cancelled) setError(cause?.message ?? String(cause)) })
         return () => { cancelled = true }
       }, [open])
+      // 状态行轮询:探测节奏是秒级,展开期间每 3 秒拉一次 probeStatus,
+      // 收起或卸载即停,不给本地服务增加常驻请求。
+      useEffect(() => {
+        if (!open) return undefined
+        let cancelled = false
+        const tick = () => {
+          api('probeStatus')
+            .then(next => {
+              if (cancelled) return
+              fetchedAtRef.current = Date.now()
+              setProbeNow(next)
+            })
+            .catch(() => { /* 状态行是辅助信息,拉取失败保持上一次内容 */ })
+        }
+        tick()
+        const pollTimer = setInterval(tick, 3000)
+        // 倒计时每秒走一格:重渲染由本定时器驱动,与 3 秒轮询解耦。
+        const clockTimer = setInterval(() => setTickClock(value => value + 1), 1000)
+        return () => {
+          cancelled = true
+          clearInterval(pollTimer)
+          clearInterval(clockTimer)
+        }
+      }, [open])
+      // 缺字段兜底:回包里没有 fairProbeIntervalSec(如后端尚是旧版本、
+      // 版本重载的错窗期)时回落默认 10 秒,避免 NaN 让受控输入框渲染成空白。
+      const secOr10 = value => {
+        const number = Number(value)
+        return Number.isFinite(number) && number >= 1 ? number : 10
+      }
       const save = async (patch) => {
         // 值没变就不写盘:避免无意义的 profile patch 写入与插件重载。
         if (!saving.current && confirmed.current !== null) {
@@ -1438,14 +1462,12 @@ window.__ModuleLoader__.load({
           if (ticket !== seq.current) return
           confirmed.current = {
             quotaProbe: next.quotaProbe === true,
-            quotaIntervalMs: next.quotaIntervalMs,
-            quotaProbeGapMs: next.quotaProbeGapMs,
+            fairProbeIntervalSec: secOr10(next.fairProbeIntervalSec),
             fallbackOnFailure: next.fallbackOnFailure !== false,
           }
           setValues({
             quotaProbe: next.quotaProbe,
-            quotaIntervalMs: next.quotaIntervalMs,
-            quotaProbeGapMs: next.quotaProbeGapMs,
+            fairProbeIntervalSec: secOr10(next.fairProbeIntervalSec),
             fallbackOnFailure: next.fallbackOnFailure !== false,
           })
           setSaved(true)
@@ -1524,49 +1546,49 @@ window.__ModuleLoader__.load({
               },
             }),
             h('span', null, t('configFallback'))))
-          // 数字:后台探测轮间隔(分钟);清空/非法时钳回服务端下限 1 分钟(审查 P1-2)。
+          // 数字:公平调度探测间隔(秒);清空/非法时钳回服务端下限 1 秒(审查 P1-2)。
           children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
             h('span', { style: { flex: 1 } }, t('configInterval')),
             h('input', {
               type: 'number',
               min: 1,
-              max: 1440,
+              max: 3600,
               step: 1,
-              value: Math.max(1, Math.round(values.quotaIntervalMs / 60_000)),
+              value: Math.max(1, Math.round(Number(values.fairProbeIntervalSec) || 10)),
               disabled: values.quotaProbe !== true,
+              // 输入过程中钳制在 1–3600,避免非法值发到服务端被拒;
+              // 清空时回落 1,失焦时下发。
               onChange: event => setValues(prev => ({
                 ...prev,
-                // 服务端区间是 1 分钟 ~ 24 小时,这里先钳住,避免把非法值发过去。
-                quotaIntervalMs: Math.min(86_400_000, Math.max(60_000, (Number(event.target.value) || 1) * 60_000)),
+                fairProbeIntervalSec: Math.min(3600, Math.max(1, Math.round(Number(event.target.value) || 1))),
               })),
-              onBlur: () => save({ quotaIntervalMs: values.quotaIntervalMs }),
-              style: numberStyle,
-            })))
-          // 数字:组内间隔(毫秒);清空时钳回 200 下限。
-          children.push(h('label', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-            h('span', { style: { flex: 1 } }, t('configGap')),
-            h('input', {
-              type: 'number',
-              min: 200,
-              max: 60000,
-              step: 100,
-              value: values.quotaProbeGapMs,
-              disabled: values.quotaProbe !== true,
-              // 输入过程中不取整、不钳下限:否则键入 "5" 立刻变成 200,
-              // 接着键入 "000" 就成了 2000——想填 5000 根本打不出来。
-              onChange: event => setValues(prev => ({
-                ...prev,
-                quotaProbeGapMs: Math.min(60_000, Math.max(0, Number(event.target.value) || 0)),
-              })),
-              // 失焦时才按 schema 的步长(100ms 的倍数)取整并下发。
-              onBlur: () => {
-                const snapped = snapProbeGap(values.quotaProbeGapMs)
-                setValues(prev => ({ ...prev, quotaProbeGapMs: snapped }))
-                save({ quotaProbeGapMs: snapped })
-              },
+              onBlur: () => save({ fairProbeIntervalSec: values.fairProbeIntervalSec }),
               style: numberStyle,
             }),
-            h('span', { style: { opacity: 0.6 } }, 'ms')))
+            h('span', { style: { opacity: 0.6 } }, 's')))
+          // 单行状态标识:优先显示正在探测的密钥;探测间隙(占绝大部分时间)
+          // 显示下一把待调度密钥与实时倒计时。倒计时用回包里的服务端时刻
+          // 抵消本机时钟偏差,剩余秒数由每秒的自增时钟驱动重算。
+          {
+            const data = probeNow
+            const probing = data?.probing ?? null
+            const next = data?.next ?? null
+            const skew = data ? Number(data.now) - fetchedAtRef.current : 0
+            const estNow = Date.now() + (Number.isFinite(skew) ? skew : 0)
+            const nextAt = Number(data?.nextAt ?? 0)
+            const remainSec = nextAt > 0 ? Math.max(0, Math.ceil((nextAt - estNow) / 1000)) : null
+            let statusText
+            if (probing !== null) {
+              statusText = `${t('probeNow')}${probing.displayName} / ${probing.alias}`
+            } else if (next !== null && remainSec !== null) {
+              statusText = `${t('probeNext')}${next.displayName} / ${next.alias} · ${remainSec}${t('probeCountdownUnit')}`
+            } else if (values !== null && values.quotaProbe !== true) {
+              statusText = t('probeOff')
+            } else {
+              statusText = t('probeIdle')
+            }
+            children.push(h('div', { style: { fontSize: 12, opacity: probing !== null ? 0.9 : 0.55 } }, statusText))
+          }
           if (saved) children.push(h('span', { style: { color: '#4caf78' } }, t('configSaved')))
         }
       }
@@ -1979,8 +2001,12 @@ window.__ModuleLoader__.load({
         probeSettings: '探测与兜底',
         configQuotaProbe: '启用密钥余额探测',
         configFallback: '密钥失效或额度不足时自动切换',
-        configInterval: '后台探测间隔(分钟)',
-        configGap: '组内探测间隔',
+        configInterval: '探测间隔(秒)',
+        probeNow: '正在探测：',
+        probeNext: '下一把：',
+        probeCountdownUnit: ' 秒后探测',
+        probeIdle: '探测空闲(等待下一轮)',
+        probeOff: '余额探测已关闭',
         configSaved: '已保存',
         rotation: '自动轮换',
         rotationOff: '关闭',
@@ -2065,8 +2091,12 @@ window.__ModuleLoader__.load({
         probeSettings: 'Probing & fallback',
         configQuotaProbe: 'Enable key quota probing',
         configFallback: 'Auto-switch on invalid key or quota exhaustion',
-        configInterval: 'Background interval (minutes)',
-        configGap: 'In-round gap',
+        configInterval: 'Probe interval (seconds)',
+        probeNow: 'Probing: ',
+        probeNext: 'Next: ',
+        probeCountdownUnit: 's to probe',
+        probeIdle: 'Idle (waiting next round)',
+        probeOff: 'Quota probing disabled',
         configSaved: 'Saved',
         rotation: 'Auto-rotate',
         rotationOff: 'Off',

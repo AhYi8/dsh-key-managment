@@ -14,7 +14,9 @@ import {
   nextAlias,
   normalizeState,
   parseAction,
-  probeRoundDelay,
+  buildProbeQueue,
+  pickProbeTarget,
+  requeueProbe,
   projectProvider,
   QUOTA_COOLDOWN_MS,
   redactSecret,
@@ -293,45 +295,105 @@ test('shouldRotateCalls 与 shouldRotateInterval 判定', async () => {
   assert.equal(shouldRotateInterval(interval, 1_000_000, 1_000_000 + 600_000), true)
 })
 
-test('probeRoundDelay:首轮立即,之后按间隔且不低于 1 分钟', () => {
-  // 第 0 轮(启动首探)不等待,间隔写坏也不能挡住启动首探。
-  assert.equal(probeRoundDelay(0, 1_800_000), 0)
-  assert.equal(probeRoundDelay(0, 0), 0)
-  assert.equal(probeRoundDelay(0, Number.NaN), 0)
-  assert.equal(probeRoundDelay(-1, 1_800_000), 0)
-  assert.equal(probeRoundDelay(Number.NaN, 1_800_000), 0)
-  // 之后每轮等待配置的间隔。
-  assert.equal(probeRoundDelay(1, 1_800_000), 1_800_000)
-  assert.equal(probeRoundDelay(3, 300_000), 300_000)
-  assert.equal(probeRoundDelay(2, 86_400_000), 86_400_000)
-  // 间隔被写坏时钳回 1 分钟下限,避免打成轮询风暴。
-  assert.equal(probeRoundDelay(1, 1), 60_000)
-  assert.equal(probeRoundDelay(1, 0), 60_000)
-  assert.equal(probeRoundDelay(1, -5), 60_000)
-  assert.equal(probeRoundDelay(1, Number.NaN), 60_000)
-  assert.equal(probeRoundDelay(1, Number.POSITIVE_INFINITY), 60_000)
-})
-
 test('validateProbeConfig 按区间与步长校验探测配置', () => {
   // 合法值通过。
   assert.equal(validateProbeConfig({}), null)
   assert.equal(validateProbeConfig({ quotaProbe: true }), null)
-  assert.equal(validateProbeConfig({ quotaIntervalMs: 60_000 }), null)
-  assert.equal(validateProbeConfig({ quotaIntervalMs: 1_800_000 }), null)
-  assert.equal(validateProbeConfig({ quotaProbeGapMs: 5_000 }), null)
+  assert.equal(validateProbeConfig({ fairProbeIntervalSec: 1 }), null)
+  assert.equal(validateProbeConfig({ fairProbeIntervalSec: 10 }), null)
+  assert.equal(validateProbeConfig({ fairProbeIntervalSec: 3600 }), null)
   // 类型错误。
   assert.equal(validateProbeConfig({ quotaProbe: 'yes' }), 'quotaProbe 必须是布尔值')
-  assert.notEqual(validateProbeConfig({ quotaIntervalMs: '60000' }), null)
+  assert.notEqual(validateProbeConfig({ fairProbeIntervalSec: '10' }), null)
   // 越界。
-  assert.equal(validateProbeConfig({ quotaIntervalMs: 59_999 }), 'quotaIntervalMs 必须是 60000-86400000 之间的数字')
-  assert.equal(validateProbeConfig({ quotaIntervalMs: 86_400_001 }), 'quotaIntervalMs 必须是 60000-86400000 之间的数字')
-  assert.equal(validateProbeConfig({ quotaProbeGapMs: 199 }), 'quotaProbeGapMs 必须是 200-60000 之间的数字')
-  assert.equal(validateProbeConfig({ quotaProbeGapMs: 60_001 }), 'quotaProbeGapMs 必须是 200-60000 之间的数字')
-  // 步长:不合规时宿主会抛英文原文错误,这里先给中文提示。
-  assert.equal(validateProbeConfig({ quotaIntervalMs: 90_000 }), 'quotaIntervalMs 必须是 60000 的倍数(整分钟)')
-  assert.equal(validateProbeConfig({ quotaProbeGapMs: 250 }), 'quotaProbeGapMs 必须是 100 的倍数')
+  assert.equal(validateProbeConfig({ fairProbeIntervalSec: 0 }), 'fairProbeIntervalSec 必须是 1-3600 之间的数字')
+  assert.equal(validateProbeConfig({ fairProbeIntervalSec: 3601 }), 'fairProbeIntervalSec 必须是 1-3600 之间的数字')
+  assert.equal(validateProbeConfig({ fairProbeIntervalSec: 1.5 }), 'fairProbeIntervalSec 必须是 1 的倍数')
   // 补丁本身必须是对象。
   assert.notEqual(validateProbeConfig(null), null)
+})
+
+test('buildProbeQueue 按供应商顺序展开为待探列表', () => {
+  const providers = {
+    alpha: { provider: 'alpha', keys: [{ id: 'a1' }, { id: 'a2' }] },
+    beta: { provider: 'beta', keys: [{ id: 'b1' }] },
+  }
+  assert.deepEqual(buildProbeQueue(providers), [
+    { provider: 'alpha', keyId: 'a1' },
+    { provider: 'alpha', keyId: 'a2' },
+    { provider: 'beta', keyId: 'b1' },
+  ])
+  // 空态与坏形态不炸。
+  assert.deepEqual(buildProbeQueue(undefined), [])
+  assert.deepEqual(buildProbeQueue({ bad: null, worse: { keys: 'x' } }), [])
+})
+
+test('pickProbeTarget 选队首可选目标,回队尾形成公平循环', () => {
+  const now = 1_000
+  const providers = {
+    alpha: {
+      provider: 'alpha',
+      keys: [
+        { id: 'a1', health: 'ok', cooldownUntil: 0 },
+        { id: 'a2', health: 'invalid', cooldownUntil: 0 },
+        { id: 'a3', health: 'limited', cooldownUntil: now + 60_000 },
+      ],
+    },
+  }
+  const queue = buildProbeQueue(providers)
+  // a1 可选被选中;a2(invalid)与 a3(冷却中)被移到队尾跳过。
+  const first = pickProbeTarget(queue, providers, now)
+  assert.deepEqual(first, { target: { provider: 'alpha', keyId: 'a1' } })
+  // 队列里只剩被移到队尾的 a2/a3:再选还是 exhausted,但它们仍在队列里
+  // (冷却到期后即可参选)。
+  const second = pickProbeTarget(queue, providers, now)
+  assert.equal(second.exhausted, true)
+  assert.equal(queue.length, 2)
+  assert.deepEqual(queue, [
+    { provider: 'alpha', keyId: 'a2' },
+    { provider: 'alpha', keyId: 'a3' },
+  ])
+  // 冷却到期:a3 恢复参选并被选中(a2 是 invalid,永久跳过但仍留在队尾)。
+  const third = pickProbeTarget(queue, providers, now + 120_000)
+  assert.deepEqual(third.target, { provider: 'alpha', keyId: 'a3' })
+  assert.deepEqual(queue, [{ provider: 'alpha', keyId: 'a2' }])
+})
+
+test('pickProbeTarget 剔除已删除的密钥与供应商', () => {
+  const now = 1_000
+  const providers = {
+    alpha: { provider: 'alpha', keys: [{ id: 'a1', health: 'ok', cooldownUntil: 0 }] },
+  }
+  const queue = [
+    { provider: 'alpha', keyId: 'gone' },
+    { provider: 'removed', keyId: 'r1' },
+    { provider: 'alpha', keyId: 'a1' },
+  ]
+  const picked = pickProbeTarget(queue, providers, now)
+  assert.deepEqual(picked.target, { provider: 'alpha', keyId: 'a1' })
+  // 不存在的目标已被剔除,不回队。
+  assert.equal(queue.length, 0)
+})
+
+test('pickProbeTarget 空队列返回 exhausted', () => {
+  assert.deepEqual(pickProbeTarget([], {}, 0), { exhausted: true })
+  assert.deepEqual(pickProbeTarget(undefined, {}, 0), { exhausted: true })
+})
+
+test('requeueProbe 探测完成后回队尾,目标已删除时不回队', () => {
+  const providers = {
+    alpha: { provider: 'alpha', keys: [{ id: 'a1' }, { id: 'a2' }] },
+  }
+  const queue = [{ provider: 'alpha', keyId: 'a2' }]
+  requeueProbe(queue, providers, { provider: 'alpha', keyId: 'a1' })
+  assert.deepEqual(queue, [
+    { provider: 'alpha', keyId: 'a2' },
+    { provider: 'alpha', keyId: 'a1' },
+  ])
+  // 目标已被删除:不回队,避免幽灵目标无限循环探测。
+  requeueProbe(queue, providers, { provider: 'alpha', keyId: 'gone' })
+  requeueProbe(queue, providers, { provider: 'removed', keyId: 'a1' })
+  assert.equal(queue.length, 2)
 })
 
 test('parseAction 校验请求体', () => {
