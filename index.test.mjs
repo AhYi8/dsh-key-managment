@@ -191,6 +191,50 @@ test('index.js:probeStatus 返回空闲与队列剩余数(探测关闭时无在�
   })
 })
 
+test('index.js:手动使用后游标同步,轮换从生效密钥的下一把开始', async () => {
+  await withTempProfile(async (dir, disposers) => {
+    const { ctx, credentials } = mockCtx(disposers)
+    withAdoptableProvider(ctx, credentials)
+    const api = apiOf(ctx, disposers)
+
+    // 桩掉 fetch:未知健康状态的候选会触发一次余额探测,不能真连 MiniMax;
+    // 固定回一个可解析的余额响应,探测结论为 ok,候选保持可选。
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        base_resp: { status_code: 0 },
+        model_remains: [{ model_name: 'general', current_interval_remaining_percent: 50 }],
+      }),
+    })
+    try {
+      await api({ action: 'adoptProvider', provider: 'minimax-cn' })
+      await api({ action: 'addKey', provider: 'minimax-cn', value: 'sk-second' })
+      const added = await api({ action: 'addKey', provider: 'minimax-cn', value: 'sk-third' })
+      const keys = added.providers[0].keys
+      assert.equal(keys.length, 3)
+
+      // 手动使用 Key_3(池尾):游标必须跟上生效密钥。
+      const third = keys.find(k => k.alias === 'Key_3')
+      const switched = await api({ action: 'activateKey', provider: 'minimax-cn', keyId: third.id })
+      assert.equal(switched.ok, true)
+      assert.equal(switched.providers[0].activeKeyId, third.id)
+
+      // 立即轮换:应从 Key_3 的下一把(Key_1)开始,而不是从旧游标(Key_2 之后)开始。
+      const rotated = await api({ action: 'rotateNow', provider: 'minimax-cn' })
+      assert.equal(rotated.ok, true)
+      assert.equal(rotated.providers[0].activeKeyId, keys.find(k => k.alias === 'Key_1').id)
+      // 再次轮换:按游标顺序推进到 Key_2。
+      const rotatedAgain = await api({ action: 'rotateNow', provider: 'minimax-cn' })
+      assert.equal(rotatedAgain.ok, true)
+      assert.equal(rotatedAgain.providers[0].activeKeyId, keys.find(k => k.alias === 'Key_2').id)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+})
+
 test('index.js:删除密钥后池子里不再有它', async () => {
   await withTempProfile(async (dir, disposers) => {
     const { ctx, credentials } = mockCtx(disposers)

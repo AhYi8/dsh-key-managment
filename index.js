@@ -387,6 +387,23 @@ export function apply(ctx, config) {
     return quotaTail
   }
 
+  /**
+   * 快照没有变化就不落盘:公平调度永不停止,若每把都写一次盘,
+   * profile 目录每 n 秒就被写一次(Windows 上还会引来杀软扫描),
+   * 界面会出现周期性卡顿——绝大多数探测结果与上一轮完全相同。
+   * fetchedAt 每次探测必然变化,比较业务字段时剔除它。
+   */
+  function stripTimestamp(snapshot) {
+    if (snapshot === undefined || snapshot === null) return null
+    const { fetchedAt, ...rest } = snapshot
+    return rest
+  }
+  async function persistQuotaIfChanged(cacheKey, previousSnapshot) {
+    const nextSnapshot = quotaStore.get(cacheKey)
+    if (JSON.stringify(stripTimestamp(previousSnapshot)) === JSON.stringify(stripTimestamp(nextSnapshot))) return
+    await persistQuota()
+  }
+
   /** 一个供应商的余额快照(不探测);界面打开弹窗只读这个,不再全量探测。 */
   function quotaFor(provider) {
     const record = requireRecord(provider)
@@ -412,6 +429,8 @@ export function apply(ctx, config) {
     if (key === undefined) return
     const profile = profileOf(record.provider)
     // force=true:后台调度是唯一刷新通道,不受 TTL 短路。
+    const cacheKey = `${record.provider}\u0000${key.id}`
+    const previousSnapshot = quotaStore.get(cacheKey)
     const payload = await probeKey(ctx, record, key, profile, quotaStore, quotaInflight, true)
     // 卸载后放弃落盘:旧实例不得覆盖新实例已写好的文件。
     if (disposed) return
@@ -420,10 +439,10 @@ export function apply(ctx, config) {
     // 但晚于本次 probeKey 的写入,这里按活池子复核,避免孤儿条目
     // 随快照文件永久残留(公平调度永不停,命中概率远高于整轮扫描时代)。
     if (liveKeyOf(record.provider, key.id) === undefined) {
-      quotaStore.delete(`${record.provider}\u0000${key.id}`)
+      quotaStore.delete(cacheKey)
     }
     if (settled.changed) await persist()
-    await persistQuota()
+    await persistQuotaIfChanged(cacheKey, previousSnapshot)
   }
 
   /** 公平调度探测间隔(毫秒):每轮现读配置,改间隔下一轮即生效;非法值回落 10 秒。 */
@@ -644,6 +663,11 @@ export function apply(ctx, config) {
     const liveKey = liveKeyOf(provider, keyId)
     if (liveKey !== undefined) liveKey.lastUsedAt = Date.now()
     liveRecord.activeKeyId = keyId
+    // 游标同步为「当前生效密钥的下一把」:手动"使用"也是一次换钥,
+    // 游标必须跟上生效密钥,否则下次轮换会从旧游标处往后找,
+    // 轮到的"下一把"可能排在生效密钥之前(游标与生效密钥错位)。
+    const activeIndex = liveRecord.keys.findIndex(entry => entry.id === keyId)
+    if (activeIndex >= 0) liveRecord.cursor = (activeIndex + 1) % liveRecord.keys.length
     // 无论手动还是自动轮换,换到新密钥都从零计数、重新计时。
     liveRecord.requestCount = 0
     liveRecord.lastRotatedAt = Date.now()
@@ -1052,7 +1076,10 @@ export function apply(ctx, config) {
     if (live(config, 'quotaProbe', true) !== true) {
       throw new Error('余额探测已在插件配置中关闭')
     }
-    if (force) quotaStore.delete(`${provider}\u0000${keyId}`)
+    // 基线在 force 删缓存之前捕获:强刷结果与之前相同也不必重写快照文件。
+    const cacheKey = `${provider}\u0000${keyId}`
+    const previousSnapshot = quotaStore.get(cacheKey)
+    if (force) quotaStore.delete(cacheKey)
     const payload = await probeKey(ctx, record, key, profileOf(provider), quotaStore, quotaInflight, force === true)
     // 手动探测也要落定健康状态:否则徽标(来自状态文件)与圆环(来自本次探测)
     // 会各说各话——圆环已经报"密钥无效",徽标还挂着"有效"。
@@ -1060,7 +1087,7 @@ export function apply(ctx, config) {
     if (settled.changed) {
       await persist()
     }
-    await persistQuota()
+    await persistQuotaIfChanged(cacheKey, previousSnapshot)
     return { ok: true, payload }
   }
 

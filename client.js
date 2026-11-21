@@ -1,11 +1,12 @@
 /**
  * 密钥管理插件 Web 客户端半区。
  *
- * - 会话页右上角 utilities slot 注册钥匙按钮,弹出悬浮框:
- *   自定义供应商下拉(含取消纳管)、密钥列表(无边框图标按钮,
- *   每行按钮组最左侧圆环余额,tooltip 式明细弹层带立即刷新,
- *   删除走 tooltip 式二次确认)、添加密钥、刷新扫描、可纳管常驻区、
- *   后台探测设置(探测开关 + 探测间隔,折叠在面板底部);
+ * - 会话页右上角 utilities slot 注册钥匙按钮,弹出悬浮框,分「密钥池 / 设置」
+ *   两个页签:密钥池页签含自定义供应商下拉(含取消纳管)、密钥列表(无边框
+ *   图标按钮,每行按钮组最左侧圆环余额,tooltip 式明细弹层带立即刷新,
+ *   删除走 tooltip 式二次确认)、添加密钥、批量添加、立即轮换、可纳管常驻区;
+ *   设置页签含自动轮换、后台探测设置(探测开关 + 探测间隔,展开平铺)、
+ *   WebDAV 备份(展开平铺);
  * - 设置页供应商卡片注册"已纳入管理"徽标。
  *
  * 数据走 Host 半区的同源 HTTP 路由(POST JSON),不引宿主 UI 原语包,
@@ -705,6 +706,8 @@ window.__ModuleLoader__.load({
       const [batchOpen, setBatchOpen] = useState(false)
       const [batchText, setBatchText] = useState('')
       const [batchResult, setBatchResult] = useState(null)
+      /** 当前页签:'pool' 密钥池 / 'settings' 设置。弹窗关闭即卸载,重开默认回密钥池。 */
+      const [tab, setTab] = useState('pool')
       /** keyId → 余额探测负载;undefined 表示尚未探测。 */
       const [quotas, setQuotas] = useState({})
       /** 正在刷新的密钥 id。 */
@@ -1154,8 +1157,21 @@ window.__ModuleLoader__.load({
         }))
         : null
 
-      // 自动轮换设置:模式选择 + 参数 + 立即轮换
-      const rotationBlock = current
+      // 立即轮换:独立按钮,挂在密钥池 Tab(设置 Tab 只放自动轮换的模式与参数)。
+      const rotateNowBlock = current
+        ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          h(IconButton, {
+            icon: 'refresh',
+            title: t('rotateNow'),
+            disabled: busy,
+            onClick: () => act('rotateNow'),
+          }),
+          h('span', { style: { opacity: 0.7 } }, t('rotateNow')))
+        : null
+
+      // 自动轮换设置(设置 Tab):模式选择 + 参数;行内标注当前选中的供应商。
+      // 尚未纳管任何供应商时给出提示,而不是渲染一行空设置。
+      const rotationBlock = state !== null && state.providers.length > 0 && current
         ? (() => {
           const rotation = current.rotation ?? { mode: 'off', intervalMs: 1_800_000, requests: 50 }
           const modes = [
@@ -1193,7 +1209,7 @@ window.__ModuleLoader__.load({
           })
           return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
             h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } },
-              h('span', { style: { opacity: 0.7 } }, `${t('rotation')}:`),
+              h('span', { style: { opacity: 0.7 } }, `${t('rotation')}${t('rotationProviderSuffix', { name: current.displayName ?? current.provider })}:`),
               h(ModePicker, {
                 value: rotation.mode,
                 options: modes,
@@ -1214,40 +1230,85 @@ window.__ModuleLoader__.load({
                     act('setRotation', { requests: count })
                   }),
                   h('span', { style: { opacity: 0.6 } }, t('rotationCallsUnit')))
-                : null,
-              h('div', { style: { flex: 1 } }),
-              h(IconButton, {
-                icon: 'refresh',
-                title: t('rotateNow'),
-                disabled: busy,
-                onClick: () => act('rotateNow'),
-              })))
+                : null))
         })()
-        : null
+        : state !== null && state.providers.length === 0
+          ? h('div', { style: { opacity: 0.7 } }, t('rotationNoProvider'))
+          : null
 
       /* ---------------- 组装面板 ---------------- */
 
+      // 页签行:文字页签,选中态用高亮底色 + 底部主题色描边。
+      const tabButton = (name, label) => h('button', {
+        onClick: () => setTab(name),
+        style: {
+          padding: '4px 10px',
+          fontSize: 12,
+          borderRadius: 6,
+          border: 'none',
+          borderBottom: tab === name
+            ? '2px solid var(--dsw-alias-border-accent, #4a6cf7)'
+            : '2px solid transparent',
+          background: tab === name
+            ? 'var(--dsw-alias-bg-tertiary, rgba(128,128,128,0.12))'
+            : 'transparent',
+          color: 'var(--dsw-alias-fg-primary, inherit)',
+          cursor: 'pointer',
+        },
+      }, label)
+      const tabBar = h('div', { style: { display: 'flex', gap: 4 } },
+        tabButton('pool', t('tabPool')),
+        tabButton('settings', t('tabSettings')))
+
+      // 两个 Tab 的内容都常驻挂载,用 display 切换可见性:
+      // 条件挂载会让"切走再切回"丢掉设置表单里未保存的输入。
       const children = []
       children.push(headerBlock)
       if (errorBlock) children.push(errorBlock)
+      children.push(tabBar)
       if (state === null) {
         children.push(h('div', { style: { opacity: 0.7 } }, t('loading')))
       } else {
+        // 密钥池 Tab:供应商下拉、当前生效、密钥列表、添加、批量、可纳管、立即轮换。
+        const poolChildren = []
         if (state.providers.length > 0) {
-          children.push(dropdownBlock)
-          if (currentBlock) children.push(currentBlock)
-          if (keyRows) children.push(keyRows)
-          children.push(addKeyBlock)
-          children.push(batchBlock)
-          if (rotationBlock) children.push(rotationBlock)
+          poolChildren.push(dropdownBlock)
+          if (currentBlock) poolChildren.push(currentBlock)
+          // 密钥列表:固定高度区域,超出在内部滚动但不显示滚动条。
+          if (keyRows) {
+            // WebKit 不认 scrollbarWidth,需注入 ::-webkit-scrollbar 规则隐藏滚动条。
+            poolChildren.push(h('style', null, '.dkm-key-list::-webkit-scrollbar{display:none}'))
+            poolChildren.push(h('div', { className: 'dkm-key-list', style: {
+              maxHeight: 320,
+              overflowY: 'auto',
+              // Firefox:隐藏滚动条仍可滚;WebKit 走上方注入的 ::-webkit-scrollbar 规则。
+              scrollbarWidth: 'none',
+              msOverflowStyle: 'none',
+              display: 'flex',
+              flexDirection: 'column',
+              // 行间距与面板原有 gap 保持一致:行本身不带外边距。
+              gap: 8,
+            } }, keyRows))
+          }
+          poolChildren.push(addKeyBlock)
+          poolChildren.push(batchBlock)
+          if (rotateNowBlock) poolChildren.push(rotateNowBlock)
         }
-        if (availableBlock) children.push(availableBlock)
+        if (availableBlock) poolChildren.push(availableBlock)
+        children.push(h('div', {
+          style: { display: tab === 'pool' ? 'flex' : 'none', flexDirection: 'column', gap: 8 },
+        }, poolChildren))
+
+        // 设置 Tab:自动轮换 → 探测与兜底 → WebDAV 备份,展开平铺。
+        const settingsChildren = []
+        if (rotationBlock) settingsChildren.push(rotationBlock)
+        settingsChildren.push(h(ProbeConfigSection))
+        // onPoolChanged:恢复整体覆盖密钥池后,让面板重拉状态刷新列表。
+        settingsChildren.push(h(BackupSection, { onPoolChanged: () => run(() => api('getState')) }))
+        children.push(h('div', {
+          style: { display: tab === 'settings' ? 'flex' : 'none', flexDirection: 'column', gap: 8 },
+        }, settingsChildren))
       }
-      // 后台探测设置:与供应商无关,始终挂在面板底部。
-      children.push(h(ProbeConfigSection))
-      // WebDAV 备份:同样与供应商无关,挂在探测设置之后。
-      // onPoolChanged:恢复整体覆盖密钥池后,让面板重拉状态刷新列表。
-      children.push(h(BackupSection, { onPoolChanged: () => run(() => api('getState')) }))
 
       return h(NarrowContext.Provider, { value: narrow }, h('div', {
         style: {
@@ -1365,11 +1426,10 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 后台探测设置(收在悬浮框内):探测开关 + 探测间隔(秒)。
-     * 默认折叠:悬浮框主体是密钥列表,探测配置属于低频操作。
+     * 后台探测设置(设置 Tab 内,展开平铺):探测开关 + 探测间隔(秒)。
+     * 挂载即拉取配置并开始状态行轮询——该组件只在设置 Tab 激活时才挂载。
      */
     function ProbeConfigSection() {
-      const [open, setOpen] = useState(false)
       const [values, setValues] = useState(null)
       const [error, setError] = useState('')
       const [saved, setSaved] = useState(false)
@@ -1394,9 +1454,8 @@ window.__ModuleLoader__.load({
         mounted.current = true
         return () => { mounted.current = false }
       }, [])
-      // 展开时才拉配置:打开悬浮框本身不额外发请求。
+      // 挂载时拉取配置。
       useEffect(() => {
-        if (!open) return undefined
         let cancelled = false
         api('getConfig')
           .then(next => {
@@ -1414,11 +1473,10 @@ window.__ModuleLoader__.load({
           })
           .catch(cause => { if (!cancelled) setError(cause?.message ?? String(cause)) })
         return () => { cancelled = true }
-      }, [open])
-      // 状态行轮询:探测节奏是秒级,展开期间每 3 秒拉一次 probeStatus,
-      // 收起或卸载即停,不给本地服务增加常驻请求。
+      }, [])
+      // 状态行轮询:探测节奏是秒级,挂载期间每 3 秒拉一次 probeStatus,
+      // 卸载即停,不给本地服务增加常驻请求。
       useEffect(() => {
-        if (!open) return undefined
         let cancelled = false
         const tick = () => {
           api('probeStatus')
@@ -1438,7 +1496,7 @@ window.__ModuleLoader__.load({
           clearInterval(pollTimer)
           clearInterval(clockTimer)
         }
-      }, [open])
+      }, [])
       // 缺字段兜底:回包里没有 fairProbeIntervalSec(如后端尚是旧版本、
       // 版本重载的错窗期)时回落默认 10 秒,避免 NaN 让受控输入框渲染成空白。
       const secOr10 = value => {
@@ -1491,29 +1549,23 @@ window.__ModuleLoader__.load({
         color: 'var(--dsw-alias-fg-primary, inherit)',
         outline: 'none',
       }
-      const toggle = h('button', {
-        onClick: () => setOpen(value => !value),
+      // 区块标题行:展开平铺,不再折叠,只做静态标题。
+      const header = h('div', {
         title: t('probeSettings'),
         style: {
           display: 'inline-flex',
           alignItems: 'center',
           gap: 6,
-          padding: '3px 8px',
           fontSize: 12,
-          borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-secondary, #333)',
-          background: 'transparent',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
-          cursor: 'pointer',
+          opacity: 0.8,
         },
       },
       h(Icon, { name: 'tune', size: 12 }),
-      h('span', { style: { flex: 1, textAlign: 'left' } }, t('probeSettings')),
-      h(Icon, { name: 'chevron', size: 11 }))
+      h('span', null, t('probeSettings')))
 
       // 数组式构建:避免深层嵌套的括号错位。
-      const children = [toggle]
-      if (open) {
+      const children = [header]
+      {
         if (error) {
           children.push(h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, error))
         }
@@ -1604,14 +1656,13 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * WebDAV 备份面板(收在悬浮框底部):配置 + 手动备份 + 云端备份列表与恢复。
-     * 默认折叠:备份是低频操作;展开时才拉取状态与备份列表。
+     * WebDAV 备份面板(设置 Tab 内,展开平铺):配置 + 手动备份 + 云端备份列表与恢复。
+     * 挂载即拉取状态与备份列表——该组件只在设置 Tab 激活时才挂载。
      *
      * @param props.onPoolChanged 恢复会整体覆盖本地密钥池,成功后必须通知
      *   父面板重新拉取状态,否则上方展示的还是恢复前的旧数据。
      */
     function BackupSection(props) {
-      const [open, setOpen] = useState(false)
       /** 来自 getConfig 的配置;文本输入的受控值。 */
       const [values, setValues] = useState(null)
       /** 来自 backupStatus 的最近一次备份结果。 */
@@ -1654,7 +1705,6 @@ window.__ModuleLoader__.load({
       }, [])
 
       useEffect(() => {
-        if (!open) return undefined
         let cancelled = false
         // 先拉配置并校验宿主版本,再决定要不要请求备份状态/列表:
         // 旧宿主会把这些请求报成"未知动作",不能让它覆盖版本提示。
@@ -1687,7 +1737,7 @@ window.__ModuleLoader__.load({
           }
         })()
         return () => { cancelled = true }
-      }, [open, refresh])
+      }, [refresh])
 
       /** 保存一个配置补丁;成功后以服务端确认值为准回填全部字段。 */
       const save = async (patch) => {
@@ -1811,28 +1861,22 @@ window.__ModuleLoader__.load({
           : h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } },
             `${t('backupLastFail')}: ${status.error ?? t('unknownError')}`)
 
-      const toggle = h('button', {
-        onClick: () => setOpen(value => !value),
+      // 区块标题行:展开平铺,不再折叠,只做静态标题。
+      const header = h('div', {
         title: t('backupSettings'),
         style: {
           display: 'inline-flex',
           alignItems: 'center',
           gap: 6,
-          padding: '3px 8px',
           fontSize: 12,
-          borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-secondary, #333)',
-          background: 'transparent',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
-          cursor: 'pointer',
+          opacity: 0.8,
         },
       },
       h(Icon, { name: 'manage', size: 12 }),
-      h('span', { style: { flex: 1, textAlign: 'left' } }, t('backupSettings')),
-      h(Icon, { name: 'chevron', size: 11 }))
+      h('span', null, t('backupSettings')))
 
-      const children = [toggle, statusLine]
-      if (open) {
+      const children = [header, statusLine]
+      {
         if (error) {
           children.push(h('div', { role: 'alert', style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, `${t('error')}: ${error}`))
         }
@@ -1961,6 +2005,8 @@ window.__ModuleLoader__.load({
       zh: {
         buttonLabel: '密钥池',
         title: '密钥池',
+        tabPool: '密钥池',
+        tabSettings: '设置',
         refresh: '刷新扫描',
         currentKey: '当前生效',
         unknownKey: '未纳入管理的密钥',
@@ -2009,6 +2055,8 @@ window.__ModuleLoader__.load({
         probeOff: '余额探测已关闭',
         configSaved: '已保存',
         rotation: '自动轮换',
+        rotationProviderSuffix: '（当前供应商：{name}）',
+        rotationNoProvider: '尚未纳管供应商，先在密钥池 Tab 纳管',
         rotationOff: '关闭',
         rotationInterval: '定时轮换',
         rotationCalls: '按调用次数',
@@ -2051,6 +2099,8 @@ window.__ModuleLoader__.load({
       en: {
         buttonLabel: 'Key pool',
         title: 'Key pool',
+        tabPool: 'Key pool',
+        tabSettings: 'Settings',
         refresh: 'Refresh scan',
         currentKey: 'Active key',
         unknownKey: 'Unmanaged key',
@@ -2099,6 +2149,8 @@ window.__ModuleLoader__.load({
         probeOff: 'Quota probing disabled',
         configSaved: 'Saved',
         rotation: 'Auto-rotate',
+        rotationProviderSuffix: ' (provider: {name})',
+        rotationNoProvider: 'No managed providers yet; manage one in the Key pool tab',
         rotationOff: 'Off',
         rotationInterval: 'By interval',
         rotationCalls: 'By call count',
