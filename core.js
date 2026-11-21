@@ -275,18 +275,20 @@ export function projectProvider(record, digests, current) {
   const currentKeyId = current?.digest !== undefined ? byDigest.get(current.digest) ?? null : null
   const unknown = current !== null && current !== undefined && current.digest !== undefined && currentKeyId === null
   const now = Date.now()
+  // 生效密钥以"原引用当前值"为准,查不到才回落到记账指针。
+  const activeKeyId = currentKeyId ?? record.activeKeyId
   return {
     provider: record.provider,
     displayName: record.displayName,
     keyCount: record.keys.length,
-    activeKeyId: currentKeyId ?? record.activeKeyId,
+    activeKeyId,
     /** 自动轮换配置与计数,供界面展示与设置。 */
     rotation: normalizeRotation(record.rotation),
     requestCount: record.requestCount ?? 0,
     lastRotatedAt: record.lastRotatedAt ?? 0,
     /** 当前原引用密钥与池内任何一把都不匹配时,给出尾号供"一键纳管"。 */
     unknown: unknown ? { tail: current.tail } : null,
-    keys: record.keys.map(key => ({
+    keys: sortViewKeys(record.keys.map(key => ({
       id: key.id,
       alias: key.alias,
       createdAt: key.createdAt,
@@ -297,8 +299,52 @@ export function projectProvider(record, digests, current) {
       // 冷却已到期的限流密钥按"有效"展示(下一轮探测会重新判定)。
       limited: key.health === 'limited' && Number(key.cooldownUntil) > now,
       cooldownUntil: key.cooldownUntil ?? 0,
-    })),
+    })), activeKeyId),
   }
+}
+
+/**
+ * 视图列表排序:有效密钥排最前,其中生效密钥再优先,其余按池内原顺序。
+ *
+ * 只作用于**视图投影**产出的副本:池内存储顺序决定轮换游标,
+ * 在这里重排会让游标指向另一把密钥,把"按顺序轮换"变成随机跳。
+ * 因此排序结果不写回 record.keys,只在展示层生效。
+ *
+ * "有效"的判定直接复用视图字段,与行上徽标严格一致:
+ * 没有"限流/无效/未知"徽标且值存在,才算有效。未探测(unknown)
+ * 与冷却中的限流都还没到可用状态,提到最前会误导用户。
+ *
+ * 注意"列表顺序 ≠ 轮换顺序":未探测的密钥沉底,但轮换会正常选中它
+ * (isSelectable 把 unknown 视为可选)。两者口径差异是有意的——
+ * 界面只把"已确认可用"的密钥提到最前,轮换则对新密钥fail-open。
+ *
+ * @param keys projectProvider 产出的密钥视图数组(元素均为对象、非空)
+ * @param activeKeyId 当前生效密钥 id(可能为 null/undefined);
+ *   它可能来自原引用摘要比对,也可能回落到记账指针
+ */
+export function sortViewKeys(keys, activeKeyId) {
+  // 与 isSelectable 同构的白名单判定(唯一的刻意差异:unknown 不算有效)。
+  // 白名单而非"排除 invalid/unknown":遇到未知的健康取值时沉底,
+  // 与"只把已确认可用的密钥提到最前"的意图一致。
+  const usable = key => key.valueMissing !== true
+    && (key.health === 'ok' || (key.health === 'limited' && key.limited !== true))
+  // 分两步:先按"是否有效"分组,再在**有效组内**按"是否生效"排序。
+  // 非有效组里不再置顶生效密钥——那会把整组顺序也打乱,与需求不符。
+  return keys
+    .map((key, index) => ({ key, index }))
+    .sort((a, b) => {
+      const aUsable = usable(a.key)
+      const bUsable = usable(b.key)
+      if (aUsable !== bUsable) return bUsable ? 1 : -1
+      if (aUsable) {
+        const activeDiff = Number(b.key.id === activeKeyId) - Number(a.key.id === activeKeyId)
+        if (activeDiff !== 0) return activeDiff
+      }
+      // 同组内用池内下标兜底,显式保证"保持原顺序";
+      // 下标唯一 ⇒ 比较结果非 0,构成严格全序,不依赖 sort 的稳定性。
+      return a.index - b.index
+    })
+    .map(entry => entry.key)
 }
 
 /**

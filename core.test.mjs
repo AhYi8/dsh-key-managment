@@ -21,6 +21,7 @@ import {
   QUOTA_COOLDOWN_MS,
   redactSecret,
   settleKeyHealth,
+  sortViewKeys,
   tailOf,
   validateAlias,
   validateKeyValue,
@@ -80,7 +81,9 @@ test('projectProvider 标注生效密钥、未知密钥与值缺失', () => {
   let view = projectProvider(record, digests, { digest: digestOf('aaa'), tail: tailOf('aaa') })
   assert.equal(view.activeKeyId, 'k1')
   assert.equal(view.unknown, null)
-  assert.equal(view.keys[1].valueMissing, true)
+  // 两把都还是 unknown(未探测)→ 同属非有效组,顺序仍是池内原序。
+  assert.deepEqual(view.keys.map(key => key.id), ['k1', 'k2'])
+  assert.equal(view.keys.find(key => key.id === 'k2')?.valueMissing, true)
 
   // 原引用值不在池内 → unknown 带尾号,供一键纳管。
   view = projectProvider(record, digests, { digest: digestOf('zzz'), tail: tailOf('zzz') })
@@ -89,6 +92,120 @@ test('projectProvider 标注生效密钥、未知密钥与值缺失', () => {
   // 原引用无值 → 不标记未知。
   view = projectProvider(record, digests, null)
   assert.equal(view.unknown, null)
+})
+
+test('sortViewKeys 把有效密钥排最前,生效密钥在有效组内优先', () => {
+  // 池内顺序:无效 → 冷却中限流 → 生效(ok) → 未知 → 冷却已过的限流。
+  const keys = [
+    { id: 'invalid', valueMissing: false, health: 'invalid', limited: false },
+    { id: 'cooling', valueMissing: false, health: 'limited', limited: true },
+    { id: 'active', valueMissing: false, health: 'ok', limited: false },
+    { id: 'unknown', valueMissing: false, health: 'unknown', limited: false },
+    { id: 'recovered', valueMissing: false, health: 'limited', limited: false },
+    { id: 'missing', valueMissing: true, health: 'ok', limited: false },
+  ]
+  const sorted = sortViewKeys(keys, 'active').map(key => key.id)
+  // 有效组:生效密钥优先,其余按池内原顺序(recovered 冷却已过 → 有效;
+  // missing 值缺失 → 不算有效)。
+  assert.deepEqual(sorted, ['active', 'recovered', 'invalid', 'cooling', 'unknown', 'missing'])
+  // 入参不被就地修改:池内存储顺序不能被动过(轮换游标依赖它)。
+  assert.deepEqual(keys.map(key => key.id),
+    ['invalid', 'cooling', 'active', 'unknown', 'recovered', 'missing'])
+})
+
+test('sortViewKeys 生效密钥在有效组内提到第一位,即使它在池内靠后', () => {
+  // 上一条用例里生效密钥在池内本就排在有效组首位,顺序"碰巧正确",
+  // 删掉"生效优先"的比较分支也照样通过——区分不出实现有没有做这件事。
+  // 这里让生效密钥必须是池内**最后一个**有效密钥,并保证有效组有多把,
+  // 使"生效优先"与"组内保持原序"两个要求互相可区分。
+  const keys = [
+    { id: 'ok1', valueMissing: false, health: 'ok', limited: false },
+    { id: 'bad', valueMissing: false, health: 'invalid', limited: false },
+    { id: 'ok2', valueMissing: false, health: 'ok', limited: false },
+    { id: 'active', valueMissing: false, health: 'ok', limited: false },
+  ]
+  assert.deepEqual(sortViewKeys(keys, 'active').map(key => key.id),
+    ['active', 'ok1', 'ok2', 'bad'])
+  // 同一份输入换成别把密钥生效:有效组内按池内原序,不做其它重排。
+  assert.deepEqual(sortViewKeys(keys, 'ok1').map(key => key.id),
+    ['ok1', 'ok2', 'active', 'bad'])
+})
+
+test('sortViewKeys 同组内保持池内原顺序', () => {
+  // 全为同一状态时只保留原序:任何"倒序/按 id 字典序"的实现都会被这里抓住。
+  const keys = [
+    { id: 'c', valueMissing: false, health: 'ok', limited: false },
+    { id: 'a', valueMissing: false, health: 'ok', limited: false },
+    { id: 'b', valueMissing: false, health: 'ok', limited: false },
+  ]
+  assert.deepEqual(sortViewKeys(keys, null).map(key => key.id), ['c', 'a', 'b'])
+})
+
+test('sortViewKeys 无生效密钥/空列表时不报错', () => {
+  assert.deepEqual(sortViewKeys([], 'x'), [])
+  const keys = [
+    { id: 'a', valueMissing: false, health: 'invalid', limited: false },
+    { id: 'b', valueMissing: false, health: 'ok', limited: false },
+  ]
+  // activeKeyId 为 null:仅按有效性分组。
+  assert.deepEqual(sortViewKeys(keys, null).map(key => key.id), ['b', 'a'])
+  // activeKeyId 指向池内不存在的 id:同 null,不置顶任何一把。
+  assert.deepEqual(sortViewKeys(keys, 'nope').map(key => key.id), ['b', 'a'])
+})
+
+test('sortViewKeys 生效密钥在非有效组内不置顶', () => {
+  // 回归:比较器曾对"是否生效"无条件生效,导致无效的生效密钥
+  // 被从原始位置抽出、插到非有效组队首,打乱"其余保持池内原顺序"。
+  const keys = [
+    { id: 'i1', valueMissing: false, health: 'invalid', limited: false },
+    { id: 'i2', valueMissing: false, health: 'invalid', limited: false },
+    { id: 'active-invalid', valueMissing: false, health: 'invalid', limited: false },
+    { id: 'ok1', valueMissing: false, health: 'ok', limited: false },
+  ]
+  assert.deepEqual(sortViewKeys(keys, 'active-invalid').map(key => key.id),
+    ['ok1', 'i1', 'i2', 'active-invalid'])
+})
+
+test('sortViewKeys 对非法健康值按"非有效"沉底', () => {
+  // 白名单口径:只有 ok / 冷却已到期的 limited 算有效;
+  // 未知取值与缺字段一律沉底,避免把来源不明的状态提到最前。
+  const keys = [
+    { id: 'weird', valueMissing: false, health: 'something-new', limited: false },
+    { id: 'nohealth', valueMissing: false, limited: false },
+    { id: 'ok', valueMissing: false, health: 'ok', limited: false },
+  ]
+  assert.deepEqual(sortViewKeys(keys, null).map(key => key.id), ['ok', 'weird', 'nohealth'])
+})
+
+test('projectProvider 的视图按有效性排序,不写回池内顺序', () => {
+  const record = newProviderRecord('temp', 'Temp', 'llm-pi-ai', 'TEMP_API_KEY')
+  record.keys = [
+    { id: 'k1', alias: 'Key_1', ref: 'REF_A', createdAt: 1, lastUsedAt: 0, health: 'invalid' },
+    { id: 'k2', alias: 'Key_2', ref: 'REF_B', createdAt: 2, lastUsedAt: 0, health: 'ok' },
+  ]
+  const digests = new Map([['REF_A', digestOf('aaa')], ['REF_B', digestOf('bbb')]])
+  // 生效的是 k1(无效),但有效组里只有 k2 → k2 排最前。
+  const view = projectProvider(record, digests, { digest: digestOf('aaa'), tail: tailOf('aaa') })
+  assert.equal(view.activeKeyId, 'k1')
+  assert.deepEqual(view.keys.map(key => key.id), ['k2', 'k1'])
+  // 池内存储顺序保持不变:游标从 k1 开始轮换的语义不能变。
+  assert.deepEqual(record.keys.map(key => key.id), ['k1', 'k2'])
+})
+
+test('projectProvider 排序用的是按值匹配的生效密钥,不是记账指针', () => {
+  // 真实场景:用户在设置页手改了原引用值。此时记账指针 record.activeKeyId
+  // 已经过时,只有"按值比对"得到的 currentKeyId 才是真正在服务的密钥,
+  // 列表置顶必须跟它走,不能跟过时的记账指针。
+  const record = newProviderRecord('temp', 'Temp', 'llm-pi-ai', 'TEMP_API_KEY')
+  record.activeKeyId = 'k2'
+  record.keys = [
+    { id: 'k1', alias: 'Key_1', ref: 'REF_A', createdAt: 1, lastUsedAt: 0, health: 'ok' },
+    { id: 'k2', alias: 'Key_2', ref: 'REF_B', createdAt: 2, lastUsedAt: 0, health: 'ok' },
+  ]
+  const digests = new Map([['REF_A', digestOf('aaa')], ['REF_B', digestOf('bbb')]])
+  const view = projectProvider(record, digests, { digest: digestOf('aaa'), tail: tailOf('aaa') })
+  assert.equal(view.activeKeyId, 'k1')
+  assert.deepEqual(view.keys.map(key => key.id), ['k1', 'k2'])
 })
 
 test('normalizeState 修复残缺状态文件', () => {
