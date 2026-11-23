@@ -4,7 +4,8 @@
  * - 会话页右上角 utilities slot 注册钥匙按钮,弹出悬浮框,分「密钥池 / 设置」
  *   两个页签:密钥池页签含自定义供应商下拉(含取消纳管)、密钥列表(无边框
  *   图标按钮,每行按钮组最左侧圆环余额,tooltip 式明细弹层带立即刷新,
- *   删除走 tooltip 式二次确认)、添加密钥、批量添加、立即轮换、可纳管常驻区;
+ *   删除走 tooltip 式二次确认,列表分页渲染每页 50 条、滚动到底自动追加)、
+ *   添加密钥、批量添加、立即轮换、可纳管常驻区;
  *   设置页签含自动轮换、后台探测设置(探测开关 + 探测间隔,展开平铺)、
  *   WebDAV 备份(展开平铺);
  * - 设置页供应商卡片注册"已纳入管理"徽标。
@@ -17,10 +18,30 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    const { useState, useEffect, useCallback, useRef, useContext } = React
+    const { useState, useEffect, useLayoutEffect, useCallback, useRef, useContext } = React
 
     /** 窄屏判定断点:手机 Web 视图统一用它,matchMedia 与语义共用一份。 */
     const NARROW_MEDIA_QUERY = '(max-width: 480px)'
+
+    /**
+     * 密钥列表每页条数:列表只在首屏渲染一页,滚动触底再追加一页。
+     * 全量密钥已在 getState 的视图里,分页只削减首屏渲染量,不增加请求。
+     * 一页(50 行)远高于列表 320px 限高,正常必然可滚;若以后调整页大小或
+     * 容器高度导致一页不满一屏,"数据变化后补页"的 effect 会继续追加兜底。
+     */
+    const KEY_PAGE_SIZE = 50
+
+    /**
+     * 列表是否已贴近底部(容差 32px):滚动触底与"数据变化后补页"共用同一判定。
+     * 惯性滚动与小数 scrollTop 下差值不会精确归零,32px 余量避免漏触发。
+     */
+    function isNearListBottom(element) {
+      if (element === null || element === undefined) return false
+      // 密钥池页签切走后容器被 display:none,clientHeight/scrollHeight 都为 0;
+      // 不排除这种情况会被误判成"已在底部",在设置页刷新时白加载一页。
+      if (element.clientHeight <= 0) return false
+      return element.scrollHeight - element.scrollTop - element.clientHeight <= 32
+    }
 
     /** 16px 线性图标集:path 是 24 视窗的描边路径。 */
     const ICON_PATHS = {
@@ -712,6 +733,10 @@ window.__ModuleLoader__.load({
       const [quotas, setQuotas] = useState({})
       /** 正在刷新的密钥 id。 */
       const [refreshingKey, setRefreshingKey] = useState(null)
+      /** 密钥列表已渲染条数:分页展示,滚动触底时追加一页。 */
+      const [visibleKeyCount, setVisibleKeyCount] = useState(KEY_PAGE_SIZE)
+      /** 密钥列表滚动容器:切换供应商时把滚动位置复位到顶部。 */
+      const keyListRef = useRef(null)
       const mounted = useRef(true)
       // 卸载守卫:挂载时复位为 true,卸载时置 false。
       // 只在 cleanup 里置 false 是不够的——React 18 StrictMode 会"挂载→卸载→再挂载",
@@ -765,7 +790,30 @@ window.__ModuleLoader__.load({
         setProvider(names.includes(wanted) ? wanted : names[0])
       }, [state]) // eslint-disable-line react-hooks/exhaustive-deps
 
+      // 切换供应商时回到第一页并滚回列表顶部。
+      // 用 layout effect 在绘制前复位:普通 effect 会先按旧页数与旧滚动位置
+      // 绘制一帧(从已展开多页的供应商切过来时会闪一下整份列表)。
+      // 不复位页数与滚动位置的话,新列表一进来就贴着底部,轻滚即触发"下一页"。
+      useLayoutEffect(() => {
+        setVisibleKeyCount(KEY_PAGE_SIZE)
+        if (keyListRef.current !== null) keyListRef.current.scrollTop = 0
+      }, [provider])
+
       const current = state?.providers?.find(entry => entry.provider === provider) ?? null
+
+      // 数据变化后若仍停在列表底部,补一页。
+      // 典型场景:恰好加载完一整页(或全部)时停在底部新增密钥——已渲染行没变,
+      // 容器不产生 scroll 事件,新密钥会一直卡在未渲染的下一页里,
+      // 用户看到"添加成功"却找不到新密钥。这里与滚动处理共用同一触底判定兜底,
+      // 顺带覆盖"一页内容不足一屏、容器不可滚"的参数组合。
+      // tab 也进依赖:设置页签期间列表被 display:none(量不到布局)而跳过,
+      // 切回密钥池页签时靠它重做一次判定,避免停留在"旧底部"的列表卡住不补页。
+      useEffect(() => {
+        const total = current?.keys.length ?? 0
+        if (visibleKeyCount >= total) return
+        if (!isNearListBottom(keyListRef.current)) return
+        setVisibleKeyCount(count => Math.min(count + KEY_PAGE_SIZE, total))
+      }, [state, provider, tab, visibleKeyCount]) // eslint-disable-line react-hooks/exhaustive-deps
 
       // 余额来自 getState 下发的持久化快照(后台定时探测维护);
       // 打开弹窗/切换供应商零探测,避免触发厂商限流。
@@ -865,8 +913,18 @@ window.__ModuleLoader__.load({
       }
 
       // 密钥列表:每行 = 名称 + 生效中标签 + 按钮组(圆环/使用/改名/删除)
+      // 分页:只把前 visibleKeyCount 条交给渲染。keys 已由服务端按有效性排好序,
+      // 切片不改变顺序、也不改 keyIndex 语义(仍是总列表下标,行内弹层翻转判定照旧)。
+      const visibleKeys = current ? current.keys.slice(0, visibleKeyCount) : []
+      // 滚动触底后追加一页。纯前端切片:全量密钥已在 state 里,无需分页请求;
+      // 到末页时函数式更新返回原值,React 会跳过重渲染,不会产生空页。
+      const handleKeyListScroll = (event) => {
+        if (!isNearListBottom(event.currentTarget)) return
+        const total = current?.keys.length ?? 0
+        setVisibleKeyCount(count => (count >= total ? count : Math.min(count + KEY_PAGE_SIZE, total)))
+      }
       const keyRows = current
-        ? current.keys.map((key, keyIndex) => {
+        ? visibleKeys.map((key, keyIndex) => {
           const rowStyle = {
             position: 'relative',
             display: 'flex',
@@ -1274,21 +1332,27 @@ window.__ModuleLoader__.load({
         if (state.providers.length > 0) {
           poolChildren.push(dropdownBlock)
           if (currentBlock) poolChildren.push(currentBlock)
-          // 密钥列表:固定高度区域,超出在内部滚动但不显示滚动条。
+          // 密钥列表:固定高度区域,超出在内部滚动但不显示滚动条;
+          // 分页渲染,滚动触底自动追加下一页。
           if (keyRows) {
             // WebKit 不认 scrollbarWidth,需注入 ::-webkit-scrollbar 规则隐藏滚动条。
             poolChildren.push(h('style', null, '.dkm-key-list::-webkit-scrollbar{display:none}'))
-            poolChildren.push(h('div', { className: 'dkm-key-list', style: {
-              maxHeight: 320,
-              overflowY: 'auto',
-              // Firefox:隐藏滚动条仍可滚;WebKit 走上方注入的 ::-webkit-scrollbar 规则。
-              scrollbarWidth: 'none',
-              msOverflowStyle: 'none',
-              display: 'flex',
-              flexDirection: 'column',
-              // 行间距与面板原有 gap 保持一致:行本身不带外边距。
-              gap: 8,
-            } }, keyRows))
+            poolChildren.push(h('div', {
+              ref: keyListRef,
+              className: 'dkm-key-list',
+              onScroll: handleKeyListScroll,
+              style: {
+                maxHeight: 320,
+                overflowY: 'auto',
+                // Firefox:隐藏滚动条仍可滚;WebKit 走上方注入的 ::-webkit-scrollbar 规则。
+                scrollbarWidth: 'none',
+                msOverflowStyle: 'none',
+                display: 'flex',
+                flexDirection: 'column',
+                // 行间距与面板原有 gap 保持一致:行本身不带外边距。
+                gap: 8,
+              },
+            }, keyRows))
           }
           poolChildren.push(addKeyBlock)
           poolChildren.push(batchBlock)
