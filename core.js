@@ -158,6 +158,9 @@ export function normalizeState(raw) {
             health: key.health === 'ok' || key.health === 'limited' || key.health === 'invalid' ? key.health : 'unknown',
             cooldownUntil: typeof key.cooldownUntil === 'number' && key.cooldownUntil > 0 ? key.cooldownUntil : 0,
             cooldownLevel: typeof key.cooldownLevel === 'number' && key.cooldownLevel > 0 ? Math.round(key.cooldownLevel) : 0,
+            // 限流原因标记只认余额不足一种:决定冷却期内是否仍参与探测调度,
+            // 旧状态文件没有此字段时为空串,行为与旧版本一致。
+            cooldownReason: key.cooldownReason === BALANCE_COOLDOWN_REASON ? BALANCE_COOLDOWN_REASON : '',
           })),
       }
     }
@@ -212,6 +215,8 @@ export function mergeRuntimeState(memoryProviders, freshProviders) {
       target.health = memoryKey.health
       target.cooldownUntil = memoryKey.cooldownUntil ?? 0
       target.cooldownLevel = memoryKey.cooldownLevel ?? 0
+      // 限流原因与冷却截止同源,随健康状态一并保留,防止被磁盘旧快照冲掉。
+      target.cooldownReason = memoryKey.cooldownReason ?? ''
     }
   }
   return freshProviders
@@ -393,7 +398,9 @@ const NO_PLAN_TEXT = /不存在\s*coding\s*plan|no\s+coding[\s_-]?plan|coding[\s
  * - ok 且所有窗口用量 <100%      → ok(有效)
  * - ok 但存在 100% 用尽的窗口    → limited(限流),冷却到窗口重置时间
  * - ok 但余额窗口不可用(余额 ≤0 或 is_available=false)
- *                                → limited,固定 10 分钟冷却
+ *                                → limited,固定 3 小时冷却,冷却期内不参与
+ *                                  探测调度(cooldownReason='balance' 仅为
+ *                                  标注限流原因,供展示与排查)
  * - 探测错误 kind=rate / 429     → limited,指数退避冷却
  * - 探测错误 kind=auth / 无凭据  → invalid(无效)
  * - 其它错误(parse/network)     → 保持原状态(健康状态与冷却时间都不动)
@@ -405,10 +412,12 @@ const NO_PLAN_TEXT = /不存在\s*coding\s*plan|no\s+coding[\s_-]?plan|coding[\s
  * @param prevCooldown 上一次的冷却截止时间;"保持原状态"时原样保留。
  *   少了它,一次探测失败(网络抖动)会把仍在冷却中的密钥立刻放回可选池,
  *   指数退避形同虚设。
+ * @param prevReason 上一次的限流原因标记;"保持原状态"时原样保留,
+ *   离开 limited 时清空(见各分支返回值)。
  */
-export function healthFromQuota(payload, prev, prevLevel, now, prevCooldown = 0) {
+export function healthFromQuota(payload, prev, prevLevel, now, prevCooldown = 0, prevReason = '') {
   if (payload === undefined || payload === null) {
-    return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0 }
+    return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0, cooldownReason: prevReason }
   }
   if (payload.status === 'ok') {
     const windows = Array.isArray(payload.windows) ? payload.windows : []
@@ -418,39 +427,41 @@ export function healthFromQuota(payload, prev, prevLevel, now, prevCooldown = 0)
     const overdrawn = windows.find(w => w?.tier === 'balance' && (
       w.available === false || (typeof w.remainingValue === 'number' && w.remainingValue <= 0)))
     if (overdrawn !== undefined) {
-      // 余额没有重置时间,给固定 10 分钟冷却;到下一轮探测会重新判定。
-      return { health: 'limited', cooldownUntil: now + QUOTA_COOLDOWN_MS, level: 0 }
+      // 余额没有重置时间,给固定 3 小时冷却;冷却期内不参与探测调度,
+      // 到期恢复参选后由下一轮探测重新判定(中途充值也只能等冷却走完)。
+      return { health: 'limited', cooldownUntil: now + BALANCE_COOLDOWN_MS, level: 0, cooldownReason: BALANCE_COOLDOWN_REASON }
     }
     const exhausted = windows.filter(w => typeof w.usedPercent === 'number' && w.usedPercent >= 100)
     if (exhausted.length > 0) {
       // 冷却到最早重置的耗尽窗口;缺重置时间则退避 10 分钟。
       const resets = exhausted.map(w => w.resetAt).filter(v => typeof v === 'number' && v > now)
       const cooldownUntil = resets.length > 0 ? Math.min(...resets) : now + QUOTA_COOLDOWN_MS
-      return { health: 'limited', cooldownUntil, level: 0 }
+      return { health: 'limited', cooldownUntil, level: 0, cooldownReason: '' }
     }
-    return { health: 'ok', cooldownUntil: 0, level: 0 }
+    return { health: 'ok', cooldownUntil: 0, level: 0, cooldownReason: '' }
   }
   if (payload.status === 'error') {
     const kind = payload.error?.kind ?? ''
     const message = String(payload.error?.message ?? '')
     if (kind === 'no-credential' || kind === 'auth' || /401|403|invalid[_ ]api[_ ]key/i.test(message)) {
-      return { health: 'invalid', cooldownUntil: 0, level: 0 }
+      return { health: 'invalid', cooldownUntil: 0, level: 0, cooldownReason: '' }
     }
     if (kind === 'rate' || /429|rate[ _-]?limit/i.test(message)) {
-      // 指数退避:连续限流翻倍,封顶 30 分钟。
+      // 指数退避:连续限流翻倍,封顶 30 分钟。限流退避中的密钥仍跳过探测
+      // 调度,避免探测请求本身继续 429、把退避无限拉长,故不给 balance 标记。
       const level = Math.min((prevLevel ?? 0) + 1, 30)
       const cooldownMs = Math.min(LIMIT_COOLDOWN_MAX_MS, LIMIT_COOLDOWN_BASE_MS * 2 ** level)
-      return { health: 'limited', cooldownUntil: now + cooldownMs, level }
+      return { health: 'limited', cooldownUntil: now + cooldownMs, level, cooldownReason: '' }
     }
     // 账号没订阅 coding 套餐:限流一天(level 归零,不参与指数退避)。
     if (NO_PLAN_TEXT.test(message)) {
-      return { health: 'limited', cooldownUntil: now + NO_PLAN_COOLDOWN_MS, level: 0 }
+      return { health: 'limited', cooldownUntil: now + NO_PLAN_COOLDOWN_MS, level: 0, cooldownReason: '' }
     }
-    // parse/network 等:探测自身问题,不改判密钥——冷却时间也原样保留。
-    return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0 }
+    // parse/network 等:探测自身问题,不改判密钥——冷却时间与原因都原样保留。
+    return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0, cooldownReason: prevReason }
   }
   // unsupported 等:维持原状。
-  return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0 }
+  return { health: prev ?? 'unknown', cooldownUntil: prevCooldown, level: prevLevel ?? 0, cooldownReason: prevReason }
 }
 
 /**
@@ -475,17 +486,20 @@ export function settleKeyHealth(providers, provider, keyId, payload, now) {
   if (record === undefined || !Array.isArray(record.keys)) return { changed: false, health: 'unknown' }
   const key = record.keys.find(entry => entry?.id === keyId)
   if (key === undefined) return { changed: false, health: 'unknown' }
-  const verdict = healthFromQuota(payload, key.health ?? 'unknown', key.cooldownLevel ?? 0, now, key.cooldownUntil ?? 0)
-  // 退避级别也要比较:级别封顶后冷却时长可能相同,但级别仍在增长,
-  // 漏判会让级别不落盘,退避重新从低级别开始。
+  const verdict = healthFromQuota(payload, key.health ?? 'unknown', key.cooldownLevel ?? 0, now, key.cooldownUntil ?? 0, key.cooldownReason ?? '')
+  // 退避级别与限流原因也要比较:级别封顶后冷却时长可能相同,但级别仍在增长,
+  // 漏判会让级别不落盘,退避重新从低级别开始;原因标记决定余额不足密钥能否
+  // 继续参与探测调度,漏判同样会让该语义丢失。
   if (key.health === verdict.health
     && (key.cooldownUntil ?? 0) === verdict.cooldownUntil
-    && (key.cooldownLevel ?? 0) === verdict.level) {
+    && (key.cooldownLevel ?? 0) === verdict.level
+    && (key.cooldownReason ?? '') === verdict.cooldownReason) {
     return { changed: false, health: verdict.health }
   }
   key.health = verdict.health
   key.cooldownUntil = verdict.cooldownUntil
   key.cooldownLevel = verdict.level
+  key.cooldownReason = verdict.cooldownReason
   return { changed: true, health: verdict.health }
 }
 
@@ -499,6 +513,19 @@ export function settleKeyHealth(providers, provider, keyId, payload, now) {
  * 池内其他密钥可能属于别的账户。冷却到期后 isSelectable 会重新放行。
  */
 export const QUOTA_COOLDOWN_MS = 10 * 60_000
+
+/**
+ * 「余额不足/透支」的固定冷却时长(仅探测判定路径)。
+ *
+ * 余额是账户级状态,10 分钟内不会有变化,过短只会带来无意义的重复探测;
+ * 但也不该像 invalid 那样永久拉黑——充值后应自动恢复。取 3 小时的同时,
+ * 这类密钥带 cooldownReason='balance' 标记,仍持续参与后台探测调度,
+ * 到期或中途充值恢复都由下一轮探测重新判定,无需等冷却走完。
+ */
+export const BALANCE_COOLDOWN_MS = 3 * 60 * 60_000
+
+/** 限流原因标记:「余额不足/透支」(探测判定)。当前仅作状态标注,供展示与排查。 */
+export const BALANCE_COOLDOWN_REASON = 'balance'
 
 /**
  * 额度/欠费类措辞。
@@ -612,7 +639,8 @@ export function isFallbackFailureChunk(chunk) {
 }
 
 /**
- * 轮换候选判定:无效密钥跳过;限流密钥在冷却期内跳过(到期自动恢复参选)。
+ * 轮换与探测调度共用的候选判定:无效密钥跳过;限流密钥(含余额不足)在
+ * 冷却期内跳过(到期自动恢复参选,由下一轮探测重新判定)。
  *
  * 注意 valueMissing 只存在于**视图投影**(projectProvider 产出),
  * 池内原始记录没有这个字段——轮换路径上"值已被外部删除"的密钥由
@@ -696,8 +724,8 @@ export function buildProbeQueue(providers) {
  * 从队首选出下一个可探测的目标(原位修改队列)。
  *
  * - 密钥已被删除(凭据无主):从队列剔除,继续找下一个;
- * - 密钥不可选(isSelectable 为假:invalid 或冷却中):移到队尾跳过,
- *   不消耗探测等待;
+ * - 密钥不可探(isSelectable 为假:invalid 或限流冷却中,含余额不足):
+ *   移到队尾跳过,不消耗探测等待;到期后自动恢复参选;
  * - 整条队列扫完都没有可探目标(全池 invalid/冷却中/空池):
  *   返回 exhausted,让宿主休眠一轮再扫,避免空转打满 CPU。
  *
@@ -720,7 +748,7 @@ export function pickProbeTarget(queue, providers, now) {
       continue
     }
     if (!isSelectable(key, now)) {
-      // 不可选:移到队尾,下次轮到时若已过冷却即可参与调度。
+      // 不可探:移到队尾,下次轮到时若已过冷却即可参与调度。
       queue.push(target)
       scanned += 1
       continue

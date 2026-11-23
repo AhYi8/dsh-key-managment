@@ -16,7 +16,7 @@
  */
 import { createCipheriv, createDecipheriv, randomBytes, scrypt } from 'node:crypto'
 import { promisify } from 'node:util'
-import { normalizeRotation, STATE_VERSION, hitValue } from './core.js'
+import { normalizeRotation, STATE_VERSION, hitValue, BALANCE_COOLDOWN_REASON } from './core.js'
 
 const scryptAsync = promisify(scrypt)
 
@@ -254,6 +254,8 @@ export async function buildSnapshot(state, resolveValue) {
         health: key.health ?? 'unknown',
         cooldownUntil: key.cooldownUntil ?? 0,
         cooldownLevel: key.cooldownLevel ?? 0,
+        // 限流原因标记随快照保留,恢复后余额不足密钥仍能继续参与探测调度。
+        cooldownReason: key.cooldownReason === BALANCE_COOLDOWN_REASON ? BALANCE_COOLDOWN_REASON : '',
         value,
       })
     }
@@ -314,6 +316,7 @@ export function normalizeRestoredSnapshot(raw) {
         health: key.health === 'ok' || key.health === 'limited' || key.health === 'invalid' ? key.health : 'unknown',
         cooldownUntil: typeof key.cooldownUntil === 'number' && key.cooldownUntil > 0 ? key.cooldownUntil : 0,
         cooldownLevel: typeof key.cooldownLevel === 'number' && key.cooldownLevel > 0 ? Math.round(key.cooldownLevel) : 0,
+        cooldownReason: key.cooldownReason === BALANCE_COOLDOWN_REASON ? BALANCE_COOLDOWN_REASON : '',
         value: key.value,
       })
     }
@@ -373,6 +376,7 @@ export function planRestore(snapshot, currentProviders, newRef) {
         health: key.health,
         cooldownUntil: key.cooldownUntil,
         cooldownLevel: key.cooldownLevel,
+        cooldownReason: key.cooldownReason ?? '',
       })
     }
     if (keys.length > 0 && !keys.some(key => key.id === activeKeyId)) {

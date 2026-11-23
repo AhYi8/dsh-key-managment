@@ -375,6 +375,27 @@ test('index.js:额度/欠费失败标 limited 并冷却,不拉黑密钥', async 
     assert.equal(failed.health, 'limited')
     assert.equal(failed.limited, true)
     assert.ok(failed.cooldownUntil > Date.now())
+    // 兜底欠费不带 balance 标记:与探测判定的余额不足区分开,
+    // 冷却期内不参与探测调度(避免残留标记把语义弄混)。
+    assert.equal(failed.cooldownReason ?? '', '')
+  })
+})
+
+test('index.js:改判 invalid 时清空 balance 原因标记', async () => {
+  await withTwoKeys(async ({ api, credentials, handlers, first }) => {
+    const signal = { aborted: false }
+    // 先触发真实的失效改判,验证 invalid 路径会把 cooldownUntil 与
+    // cooldownReason 一并清空,不留脏状态。
+    const failure = { code: 'AUTH', message: '401: {"error":{"message":"Incorrect API key provided"}}' }
+    await observe(handlers.get('llm/stream'), 'minimax-cn', signal, [failureChunk(failure)])
+    const { action } = await recoverAt(handlers.get('agent/request-error'),
+      { provider: 'minimax-cn', failure, signal })
+    assert.deepEqual(action, { kind: 'retry' })
+    const state = await api({ action: 'getState' })
+    const failed = state.providers[0].keys.find(key => key.id === first.id)
+    assert.equal(failed.health, 'invalid')
+    assert.equal(failed.cooldownUntil ?? 0, 0)
+    assert.equal(failed.cooldownReason ?? '', '')
   })
 })
 

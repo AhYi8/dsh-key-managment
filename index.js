@@ -626,7 +626,7 @@ export function apply(ctx, config) {
     const ref = newPoolRef(provider)
     await ctx.credentials.set(ref, value)
     const record = newProviderRecord(found.provider, found.displayName, found.settingsNs, found.keyRef)
-    const firstKey = { id: newKeyId(), alias: 'Key_1', ref, createdAt: Date.now(), lastUsedAt: Date.now(), health: 'unknown', cooldownUntil: 0 }
+    const firstKey = { id: newKeyId(), alias: 'Key_1', ref, createdAt: Date.now(), lastUsedAt: Date.now(), health: 'unknown', cooldownUntil: 0, cooldownLevel: 0, cooldownReason: '' }
     record.keys = [firstKey]
     // 新纳管的供应商插公平调度队列队首:下一次调度立即探测。
     probeQueue.unshift({ provider, keyId: firstKey.id })
@@ -725,6 +725,9 @@ export function apply(ctx, config) {
         target.health = 'invalid'
         target.cooldownUntil = 0
         target.cooldownLevel = 0
+        // 离开 limited 后原因标记必须一并清空,否则残留的 balance 标记
+        // 会让状态语义自相矛盾(字段当前仅作标注,但仍不应留脏值)。
+        target.cooldownReason = ''
         // 计数同样要写在活记录上:写进旧对象就清不掉,
         // 阈值持续满足 → 之后每个请求都触发一次轮换。
         requireRecord(provider).requestCount = 0
@@ -833,10 +836,14 @@ export function apply(ctx, config) {
       key.health = 'invalid'
       key.cooldownUntil = 0
       key.cooldownLevel = 0
+      key.cooldownReason = ''
     } else {
       key.health = 'limited'
       key.cooldownUntil = Date.now() + QUOTA_COOLDOWN_MS
       key.cooldownLevel = 0
+      // 调用兜底的欠费维持 10 分钟冷却且不带 balance 标记:与探测判定路径
+      // 区分开,这类密钥冷却期内不参与探测调度,到期后由探测重新判定。
+      key.cooldownReason = ''
     }
     return true
   }
@@ -912,6 +919,12 @@ export function apply(ctx, config) {
       ref,
       createdAt: Date.now(),
       lastUsedAt: 0,
+      // 与 normalizeState 的密钥形态对齐:补全健康相关字段,避免读到
+      // undefined 再被归一化(读回磁盘前的一致性)。
+      health: 'unknown',
+      cooldownUntil: 0,
+      cooldownLevel: 0,
+      cooldownReason: '',
     })
     // 新密钥插公平调度队列的队首:下一次调度立即探测它。
     probeQueue.unshift({ provider: liveRecord.provider, keyId: newId })

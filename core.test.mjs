@@ -19,6 +19,9 @@ import {
   requeueProbe,
   projectProvider,
   QUOTA_COOLDOWN_MS,
+  BALANCE_COOLDOWN_MS,
+  BALANCE_COOLDOWN_REASON,
+  isSelectable,
   redactSecret,
   settleKeyHealth,
   sortViewKeys,
@@ -332,12 +335,13 @@ test('healthFromQuota:余额型窗口按官方可用性与余额判定', async (
   assert.equal(healthFromQuota(
     { status: 'ok', windows: [{ tier: 'balance', remainingValue: 12.34, available: true }] },
     'ok', 0, now).health, 'ok')
-  // 余额 0 → 限流,固定 10 分钟冷却(余额窗口没有重置时间)。
+  // 余额 0 → 限流,固定 3 小时冷却(余额窗口没有重置时间)。
   const empty = healthFromQuota(
     { status: 'ok', windows: [{ tier: 'balance', remainingValue: 0, available: false }] },
     'ok', 0, now)
   assert.equal(empty.health, 'limited')
-  assert.equal(empty.cooldownUntil, now + 600_000)
+  assert.equal(empty.cooldownUntil, now + BALANCE_COOLDOWN_MS)
+  assert.equal(empty.cooldownReason, BALANCE_COOLDOWN_REASON)
   // 透支余额是负数,同样不可用。
   assert.equal(healthFromQuota(
     { status: 'ok', windows: [{ tier: 'balance', remainingValue: -0.01, available: false }] },
@@ -568,7 +572,7 @@ test('mergeRuntimeState 保留内存里的健康判定,不被磁盘旧快照覆�
   const memory = {
     p1: {
       keys: [
-        { id: 'k1', health: 'limited', cooldownUntil: 999, cooldownLevel: 3 },
+        { id: 'k1', health: 'limited', cooldownUntil: 999, cooldownLevel: 3, cooldownReason: 'balance' },
         { id: 'k2', health: 'unknown', cooldownUntil: 0, cooldownLevel: 0 },
       ],
     },
@@ -590,9 +594,25 @@ test('mergeRuntimeState 保留内存里的健康判定,不被磁盘旧快照覆�
   assert.equal(merged.p1.keys[0].cooldownUntil, 999)
   // 退避级别也要带过去:否则连续限流的惩罚会在每次同步后从头开始。
   assert.equal(merged.p1.keys[0].cooldownLevel, 3)
+  // 原因标记同源保留:balance 标记丢了,余额不足密钥会在探测调度里被误跳过。
+  assert.equal(merged.p1.keys[0].cooldownReason, 'balance')
   // 内存仍是 unknown(尚未探测)→ 不覆盖磁盘上已有的结论。
   assert.equal(merged.p1.keys[1].health, 'limited')
   assert.equal(merged.p1.keys[1].cooldownUntil, 555)
+  assert.equal(merged.p1.keys[1].cooldownReason, '')
+})
+
+test('mergeRuntimeState 保留内存的 cooldownReason,不被磁盘旧快照冲掉', () => {
+  const memory = {
+    p1: { keys: [{ id: 'k1', health: 'limited', cooldownUntil: 999, cooldownLevel: 0, cooldownReason: 'balance' }] },
+  }
+  // 磁盘快照是旧数据:同样的 limited 但没有 balance 标记。
+  const fresh = normalizeState({
+    providers: { p1: { keyRef: 'P1_KEY', keys: [{ id: 'k1', ref: 'R1', health: 'limited', cooldownUntil: 100 }] } },
+  })
+  const merged = mergeRuntimeState(memory, fresh.providers)
+  assert.equal(merged.p1.keys[0].cooldownUntil, 999)
+  assert.equal(merged.p1.keys[0].cooldownReason, 'balance')
 })
 
 test('mergeRuntimeState 内存判为有效时覆盖磁盘上的限流旧值', () => {
@@ -696,6 +716,25 @@ test('settleKeyHealth 探测失败时不清掉限流冷却', async () => {
   assert.equal(settled.health, 'limited')
   assert.equal(providers.p1.keys[0].cooldownUntil, now + 300_000)
   assert.equal(providers.p1.keys[0].cooldownLevel, 2)
+})
+
+test('settleKeyHealth 探测失败时保留 balance 原因标记', () => {
+  const now = 1_000_000
+  const providers = {
+    p1: {
+      keys: [{ id: 'k1', ref: 'R1', health: 'limited', cooldownUntil: now + 300_000, cooldownLevel: 0, cooldownReason: 'balance' }],
+    },
+  }
+  // 网络抖动:结论为"保持原状态",balance 标记必须原样保留——
+  // 早退比较若漏了 reason,一次抖动就会把标记静默清掉,探测调度随之误跳过。
+  const jitter = settleKeyHealth(providers, 'p1', 'k1',
+    { status: 'error', error: { kind: 'network', message: 'timeout' } }, now)
+  assert.equal(jitter.changed, false)
+  assert.equal(providers.p1.keys[0].cooldownReason, 'balance')
+  // payload 缺失(探测负载丢失)同样保留。
+  const missing = settleKeyHealth(providers, 'p1', 'k1', undefined, now)
+  assert.equal(missing.changed, false)
+  assert.equal(providers.p1.keys[0].cooldownReason, 'balance')
 })
 
 test('settleKeyHealth 退避级别变化时也判定为变更', async () => {
@@ -977,12 +1016,92 @@ test('isFallbackFailureChunk 只认终止失败块', () => {
   assert.equal(isFallbackFailureChunk({ type: 'finish', reason: null }), false)
 })
 
-test('额度冷却常量被余额窗口判定复用', () => {
-  // 不再断言常量本身(恒真),而是断言判定结果真的用了它。
+test('余额窗口判定使用 3 小时冷却并带 balance 原因标记', () => {
   const now = 1_000_000
   const verdict = healthFromQuota({ status: 'ok', windows: [{ tier: 'balance', remainingValue: 0 }] }, 'ok', 0, now)
   assert.equal(verdict.health, 'limited')
-  assert.equal(verdict.cooldownUntil, now + QUOTA_COOLDOWN_MS)
+  assert.equal(verdict.cooldownUntil, now + BALANCE_COOLDOWN_MS)
+  assert.equal(verdict.cooldownReason, BALANCE_COOLDOWN_REASON)
+  // is_available=false 同样命中余额不足路径。
+  const verdict2 = healthFromQuota({ status: 'ok', windows: [{ tier: 'balance', available: false, remainingValue: 5 }] }, 'ok', 0, now)
+  assert.equal(verdict2.health, 'limited')
+  assert.equal(verdict2.cooldownUntil, now + BALANCE_COOLDOWN_MS)
+  assert.equal(verdict2.cooldownReason, BALANCE_COOLDOWN_REASON)
+})
+
+test('healthFromQuota:balance 密钥遇 429 改判退避时清空原因标记', () => {
+  const now = 1_000_000
+  // 上一轮还是余额不足,这一轮探测打了 429:健康判定切换到指数退避,
+  // balance 标记必须清空——退避冷却中的密钥不参与探测调度,残留标记
+  // 会让该语义自相矛盾。
+  const verdict = healthFromQuota(
+    { status: 'error', error: { kind: 'rate', message: '429 Too Many Requests' } },
+    'limited', 0, now, now + BALANCE_COOLDOWN_MS, BALANCE_COOLDOWN_REASON)
+  assert.equal(verdict.health, 'limited')
+  assert.equal(verdict.cooldownReason, '')
+  // 退避封顶(level=30)时同样为空,冷却封顶在 30 分钟。
+  const capped = healthFromQuota(
+    { status: 'error', error: { kind: 'rate', message: '429' } },
+    'limited', 30, now, now + 30 * 60_000, '')
+  assert.equal(capped.cooldownUntil, now + 30 * 60_000)
+  assert.equal(capped.cooldownReason, '')
+})
+
+test('settleKeyHealth:余额不足结论写入 cooldownReason,恢复 ok 后清空', () => {
+  const now = 1_000_000
+  const providers = { deepseek: { provider: 'deepseek', keys: [{ id: 'k1', health: 'ok', cooldownUntil: 0, cooldownLevel: 0, cooldownReason: '' }] } }
+  const drained = settleKeyHealth(providers, 'deepseek', 'k1', { status: 'ok', windows: [{ tier: 'balance', remainingValue: 0 }] }, now)
+  assert.equal(drained.changed, true)
+  assert.equal(providers.deepseek.keys[0].cooldownUntil, now + BALANCE_COOLDOWN_MS)
+  assert.equal(providers.deepseek.keys[0].cooldownReason, BALANCE_COOLDOWN_REASON)
+  // 充值后下一轮探测立即恢复,原因标记一并清空。
+  const restored = settleKeyHealth(providers, 'deepseek', 'k1', { status: 'ok', windows: [{ tier: 'balance', remainingValue: 9 }] }, now)
+  assert.equal(restored.changed, true)
+  assert.equal(restored.health, 'ok')
+  assert.equal(providers.deepseek.keys[0].health, 'ok')
+  assert.equal(providers.deepseek.keys[0].cooldownUntil, 0)
+  assert.equal(providers.deepseek.keys[0].cooldownReason, '')
+})
+
+test('pickProbeTarget:余额不足冷却中的密钥不参与探测调度', () => {
+  const now = 1_000_000
+  const providers = { deepseek: { provider: 'deepseek', keys: [{ id: 'k1', ref: 'R1', health: 'limited', cooldownUntil: now + 1000, cooldownReason: BALANCE_COOLDOWN_REASON }] } }
+  // 余额不足冷却中的密钥移到队尾跳过:全池只剩它时返回 exhausted,
+  // 冷却到期(isSelectable 放行)后自动恢复参选。
+  const queue = [{ provider: 'deepseek', keyId: 'k1' }]
+  assert.ok(pickProbeTarget(queue, providers, now).exhausted)
+  assert.deepEqual(queue, [{ provider: 'deepseek', keyId: 'k1' }])
+  // 轮换同样不选中:冷却期内不可作为服务密钥。
+  assert.equal(isSelectable(providers.deepseek.keys[0], now), false)
+  // 到期后恢复参选。
+  assert.deepEqual(
+    pickProbeTarget([{ provider: 'deepseek', keyId: 'k1' }], providers, now + 2000).target,
+    { provider: 'deepseek', keyId: 'k1' })
+})
+
+test('pickProbeTarget:不可探密钥移队尾,不阻塞后续可探目标', () => {
+  const now = 1_000_000
+  const providers = { p1: { provider: 'p1', keys: [
+    // k1:退避冷却中不可探;k2:可探。队列顺序 k1 → k2。
+    { id: 'k1', ref: 'R1', health: 'limited', cooldownUntil: now + 1000, cooldownReason: '' },
+    { id: 'k2', ref: 'R2', health: 'ok' },
+  ] } }
+  const queue = [{ provider: 'p1', keyId: 'k1' }, { provider: 'p1', keyId: 'k2' }]
+  const picked = pickProbeTarget(queue, providers, now)
+  // 跳过 k1 选中 k2;k1 被移到队尾,k2 已出队(返回目标)。
+  assert.deepEqual(picked.target, { provider: 'p1', keyId: 'k2' })
+  assert.deepEqual(queue, [{ provider: 'p1', keyId: 'k1' }])
+})
+
+test('normalizeState 保留 cooldownReason 且非法值回落为空', () => {
+  const state = normalizeState({ providers: { deepseek: {
+    keyRef: 'ref', keys: [
+      { id: 'k1', ref: 'r1', health: 'limited', cooldownUntil: 1000, cooldownReason: 'balance' },
+      { id: 'k2', ref: 'r2', health: 'limited', cooldownUntil: 1000, cooldownReason: 'hacked' },
+    ],
+  } } })
+  assert.equal(state.providers.deepseek.keys[0].cooldownReason, 'balance')
+  assert.equal(state.providers.deepseek.keys[1].cooldownReason, '')
 })
 
 test('validateProbeConfig 拒绝非布尔的 fallbackOnFailure', () => {

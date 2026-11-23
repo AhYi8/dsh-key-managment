@@ -175,6 +175,53 @@ test('normalizeRestoredSnapshot 清洗非法条目并拒绝坏结构', () => {
   assert.equal(cleaned.providers.p1.keys[0].value, 'sk-1')
 })
 
+test('backup:快照往返保留 balance 原因标记并清洗非法值', async () => {
+  // 备份侧:buildSnapshot 保留 balance 标记,非法值回落为空串。
+  const state = normalizeState({
+    providers: {
+      p1: {
+        provider: 'p1', keyRef: 'P1_KEY', activeKeyId: 'k1',
+        keys: [
+          { id: 'k1', alias: 'Key_1', ref: 'REF_A', health: 'limited', cooldownUntil: 1000, cooldownReason: 'balance' },
+          { id: 'k2', alias: 'Key_2', ref: 'REF_B', health: 'limited', cooldownUntil: 1000, cooldownReason: 'hacked' },
+        ],
+      },
+    },
+  })
+  const snapshot = await buildSnapshot(state, async (ref) => `sk-${ref}`)
+  assert.equal(snapshot.providers.p1.keys[0].cooldownReason, 'balance')
+  assert.equal(snapshot.providers.p1.keys[1].cooldownReason, '')
+
+  // 恢复侧:normalizeRestoredSnapshot 只认 balance,缺失/非法都回落为空。
+  const restored = normalizeRestoredSnapshot({
+    version: 1,
+    providers: {
+      p1: {
+        provider: 'p1', keyRef: 'P1_KEY', keyRefValue: 'sk-origin', activeKeyId: 'k1',
+        keys: [
+          { id: 'k1', alias: 'Key_1', value: 'sk-1', health: 'limited', cooldownUntil: 1000, cooldownReason: 'balance' },
+          { id: 'k2', alias: 'Key_2', value: 'sk-2', health: 'limited', cooldownUntil: 1000, cooldownReason: 42 },
+        ],
+      },
+    },
+  })
+  assert.equal(restored.providers.p1.keys[0].cooldownReason, 'balance')
+  assert.equal(restored.providers.p1.keys[1].cooldownReason, '')
+
+  // 计划侧:旧版本快照缺 cooldownReason 字段时回落为空串(?? '' 回退分支)。
+  const legacy = normalizeRestoredSnapshot({
+    version: 1,
+    providers: {
+      p1: {
+        provider: 'p1', keyRef: 'P1_KEY', keyRefValue: 'sk-origin', activeKeyId: 'k1',
+        keys: [{ id: 'k1', alias: 'Key_1', value: 'sk-1', health: 'limited', cooldownUntil: 1000 }],
+      },
+    },
+  })
+  const plan = planRestore(legacy, {}, provider => newPoolRef(provider))
+  assert.equal(plan.providers.p1.keys[0].cooldownReason, '')
+})
+
 test('planRestore 生成新引用、覆盖原引用、清理被移除供应商', () => {
   const snapshot = normalizeRestoredSnapshot({
     version: 1,
