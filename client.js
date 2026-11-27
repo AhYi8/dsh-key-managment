@@ -59,6 +59,89 @@ window.__ModuleLoader__.load({
       tune: 'M4 7h8M16 7h4M4 17h4M12 17h8M14 4v6M8 14v6',
     }
 
+    /**
+     * 状态色向 label-primary 收拢的比例(百分比)。
+     *
+     * 60 这个数的来历:亮色主题下三种状态色直接当文字色只有 2.28 / 2.15 / 4.50,
+     * 11px 小字读不清。混向 label-primary 后实测 5.18 / 4.93 / 8.91(均过 AA 4.5)。
+     * 刚好达到 4.5:1 的临界比例是 success 66.3%、warn 64.1%,60% 留了 4~6 个点余量。
+     *
+     * 余量偏窄的方向性风险:宿主把状态色调**深**是安全的(对比度只会更高);
+     * 调**浅**才会跌破 —— 例如 success 换成 #4ade80 时 60% 只有 4.18 不达标。
+     * 届时把这里的数字调小即可(比例越小越接近 label-primary,对比度越高)。
+     */
+    const STATUS_MIX_PERCENT = 60
+
+    /**
+     * 状态语义色(用于文字、进度填充、徽章)。
+     *
+     * 直接拿宿主的 --dsw-alias-state-*-primary 当白底小字色对比度不足:
+     * 绿 #22c55e 仅 2.28:1、黄 #f59e0b 仅 2.15:1,11px 文字读不清。
+     * 宿主这两类令牌是给图形/图标/徽章底色设计的,不是给文字设计的。
+     *
+     * 这里用 color-mix 把状态色向 label-primary 收拢(比例见 STATUS_MIX_PERCENT):
+     * 亮色主题下 label-primary 是近黑色,自动把颜色压深;暗色主题下是近白色,
+     * 自动把颜色提亮。同一表达式在两个主题下各自达到 WCAG AA。
+     * 暗色数值按 layer-1 计为 9.21/9.70/7.46;面板实际底色是 layer-2,对应 8.17/8.61/6.62。
+     *
+     * color-mix(in srgb, ...) 是宿主自身的既定写法(宿主产物里大量使用),
+     * 目标运行时是 Electron 44.7,其 Chromium 版本远高于该特性所需的 111。
+     * 万一它失效,整条 color 声明会被丢弃、颜色回退到继承值 —— 本插件所有
+     * STATUS_COLOR 的落点都在 PoolPanel 根 div(已设 label-primary)之内,
+     * 所以继承值仍是可读的主文字色,不会重现深底深字。改动面板根 div 的 color
+     * 时要保住这条兜底链。
+     *
+     * 令牌名必须写全字面量、不能用模板串拼:theme.test.mjs 靠扫描源码里的
+     * 完整令牌名做白名单校验,拼出来的名字它看不见,等于绕过护栏。
+     * 只有百分比数字可以插值,不影响扫描。
+     */
+    const STATUS_COLOR = {
+      success: `color-mix(in srgb, var(--dsw-alias-state-success-primary) ${STATUS_MIX_PERCENT}%, var(--dsw-alias-label-primary))`,
+      warn: `color-mix(in srgb, var(--dsw-alias-state-warn-primary) ${STATUS_MIX_PERCENT}%, var(--dsw-alias-label-primary))`,
+      error: `color-mix(in srgb, var(--dsw-alias-state-error-primary) ${STATUS_MIX_PERCENT}%, var(--dsw-alias-label-primary))`,
+    }
+
+    /**
+     * 浮层的不透明底:一层恒定不透明的兜底 + 一层皮肤色调。
+     *
+     * 背景:部分主题/皮肤会把背景令牌写成半透明(例:dream-skin 的 mist 皮肤
+     * 里 layer-1 是 rgba(240,248,255,0.62)、layer-2 是 rgba(252,253,255,0.94)),
+     * 浮层直接用它当底色就会透出背后聊天气泡的文字。
+     *
+     * 为什么不能拿 --dsw-alias-bg-base 兜底:启用壁纸时,皮肤会把它重写成
+     * rgba(基底色, 壁纸不透明度)。用户把壁纸不透明度调到 0.3,这个令牌就只有
+     * 30% 不透明,拿它当"不透明底"反而更透。
+     *
+     * 为什么也不能只靠 layer-2 多叠几层:layer-2 的 alpha 不是常量,它会被
+     * 皮肤设置里的"弹窗透明度"滑块重写。用户拖到 50% 时,叠三层还有 12.5% 残透;
+     * 拖到 30% 时残透 34.3%;拖到 0 就是全透明 —— 叠层只是在近似,安全性押在
+     * 用户没动滑块上。当前之所以不显形,是因为滑块恰好在 100%。
+     *
+     * 所以这里改成"兜底色恒为不透明 + 上面铺一层皮肤色调":
+     *   - label-primary-foreground 亮色是 #fff、暗色是 #0f1115,两套主题都完全不透明,
+     *     且不在皮肤会改写的令牌之列(壁纸/弹窗滑块都碰不到它);
+     *   - layer-2 只负责带上该皮肤自己的色调,它透不准也不影响最终不透明。
+     * 合成 alpha 恒为 1,与 layer-2 的 alpha 无关,叠层数也从 3 降到 2。
+     */
+    const OPAQUE_SURFACE_STYLE = {
+      backgroundColor: 'var(--dsw-alias-label-primary-foreground)',
+      backgroundImage: 'linear-gradient(var(--dsw-alias-bg-layer-2), var(--dsw-alias-bg-layer-2))',
+    }
+
+    /** 最常用的一档细边(16 处):宿主 l2 边框。改令牌只需动这一处。 */
+    const HAIRLINE_L2 = '1px solid var(--dsw-alias-border-l2)'
+
+    /**
+     * 文本输入类控件的公共皮肤(7 处):输入框、下拉触发器、数字框、文本域共用。
+     * 只收拢完全一致的三个属性;padding、fontSize、borderRadius 各站点确实不同,
+     * 留在原处,不为了统一而统一。
+     */
+    const FIELD_SKIN = {
+      border: HAIRLINE_L2,
+      background: 'var(--dsw-alias-bg-layer-2)',
+      color: 'var(--dsw-alias-label-primary)',
+    }
+
     function Icon(props) {
       return h('svg', {
         width: props.size ?? 15,
@@ -100,14 +183,18 @@ window.__ModuleLoader__.load({
           border: 'none',
           background: props.primary
             ? (props.danger
-              ? 'var(--dsw-alias-fg-danger, #e07070)'
-              : 'var(--dsw-alias-bg-accent, #4a6cf7)')
+              // 危险主按钮:底色直接用错误色,前景沿用 label-primary-foreground。
+              // 亮色 #ec1313 配 #fff = 4.50、暗色 #f25a5a 配 #0f1115 = 5.75,都达标。
+              // 不要换成宿主的 label-on-color(纯白):暗色下只有 3.29,反而更差。
+              ? 'var(--dsw-alias-state-error-primary)'
+              : 'var(--dsw-alias-button-primary-fill)')
             : 'transparent',
           color: props.primary
-            ? 'var(--dsw-alias-fg-on-accent, #fff)'
+            ? 'var(--dsw-alias-label-primary-foreground)'
             : props.danger
-              ? 'var(--dsw-alias-fg-danger, #e07070)'
-              : 'var(--dsw-alias-fg-primary, inherit)',
+              // 危险图标按钮:图标即文字色,要按 White 底可读性走混色。
+              ? STATUS_COLOR.error
+              : 'var(--dsw-alias-label-primary)',
           cursor: props.disabled ? 'default' : 'pointer',
           opacity: props.disabled ? 0.4 : 1,
           flex: 'none',
@@ -126,8 +213,8 @@ window.__ModuleLoader__.load({
           borderRadius: 999,
           fontSize: 11,
           flex: 'none',
-          color: props.color ?? 'var(--dsw-alias-fg-tertiary, #999)',
-          border: `1px solid ${props.color ?? 'var(--dsw-alias-border-secondary, #444)'}`,
+          color: props.color ?? 'var(--dsw-alias-label-tertiary)',
+          border: `1px solid ${props.color ?? 'var(--dsw-alias-border-l2)'}`,
           background: 'transparent',
         },
       }, props.label)
@@ -233,10 +320,10 @@ window.__ModuleLoader__.load({
           ...narrowWidth,
           padding: 10,
           borderRadius: 10,
-          border: '1px solid var(--dsw-alias-border-secondary, #333)',
-          background: 'var(--dsw-alias-bg-primary, #1b1b1f)',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
-          boxShadow: '0 6px 20px rgba(0,0,0,0.4)',
+          border: HAIRLINE_L2,
+          ...OPAQUE_SURFACE_STYLE,
+          color: 'var(--dsw-alias-label-primary)',
+          boxShadow: 'var(--dsw-shadow-lv3)',
           fontSize: 12,
           display: 'flex',
           flexDirection: 'column',
@@ -294,8 +381,9 @@ window.__ModuleLoader__.load({
 
     /** 剩余额度的分档色:剩余 <10% 红、<30% 黄、否则绿。 */
     function remainingColor(remaining) {
-      if (remaining === undefined) return 'var(--dsw-alias-fg-tertiary, #777)'
-      return remaining < 10 ? '#d95c5c' : remaining < 30 ? '#d9a13c' : '#4caf78'
+      if (remaining === undefined) return 'var(--dsw-alias-label-tertiary)'
+      if (remaining < 10) return STATUS_COLOR.error
+      return remaining < 30 ? STATUS_COLOR.warn : STATUS_COLOR.success
     }
 
     /** 窗口标签的中文映射。 */
@@ -337,7 +425,7 @@ window.__ModuleLoader__.load({
       const radius = 7
       const circumference = 2 * Math.PI * radius
       const color = balance !== undefined
-        ? (balanceEmpty ? '#d95c5c' : '#4caf78')
+        ? (balanceEmpty ? STATUS_COLOR.error : STATUS_COLOR.success)
         : remainingColor(remaining)
       const amountText = balance === undefined ? undefined : formatAmount(balance.value, balance.unit)
       const title = payload === undefined
@@ -372,7 +460,8 @@ window.__ModuleLoader__.load({
         }, h('svg', { width: 18, height: 18, viewBox: '0 0 18 18', 'aria-hidden': true },
           h('circle', {
             cx: 9, cy: 9, r: radius, fill: 'none',
-            stroke: 'var(--dsw-alias-border-secondary, #333)',
+            // 主题令牌必须走 style:SVG 演示属性不解析 var(),写在属性上会失效。
+            style: { stroke: 'var(--dsw-alias-border-l2)' },
             strokeWidth: 2.5,
             // 余额不可用时用虚线,与错误态一致,提示"不是百分比进度"。
             strokeDasharray: payload?.status === 'error' || (balance !== undefined && balanceEmpty) ? '2 3' : undefined,
@@ -381,14 +470,14 @@ window.__ModuleLoader__.load({
           // 金额本身在 title 与明细弹层里给出。
           balance !== undefined ? h('circle', {
             cx: 9, cy: 9, r: radius, fill: 'none',
-            stroke: color,
+            style: { stroke: color },
             strokeWidth: 2.5,
             strokeLinecap: 'round',
             strokeDasharray: balanceEmpty ? '2 3' : undefined,
           }) : null,
           remainingRatio !== undefined ? h('circle', {
             cx: 9, cy: 9, r: radius, fill: 'none',
-            stroke: color,
+            style: { stroke: color },
             strokeWidth: 2.5,
             strokeLinecap: 'round',
             strokeDasharray: `${remainingRatio * circumference} ${circumference}`,
@@ -397,17 +486,17 @@ window.__ModuleLoader__.load({
           remaining !== undefined
             ? h('text', {
               x: 9, y: 9, textAnchor: 'middle', dominantBaseline: 'central',
-              fontSize: 5.5, fill: color,
+              fontSize: 5.5, style: { fill: color },
             }, String(Math.round(remaining)))
             : balance !== undefined
               ? h('text', {
                 x: 9, y: 9, textAnchor: 'middle', dominantBaseline: 'central',
-                fontSize: 7, fill: color,
+                fontSize: 7, style: { fill: color },
               }, balanceEmpty ? '!' : (balance.unit === 'usd' ? '$' : '¥'))
               : payload?.status === 'unsupported'
                 ? h('text', {
                   x: 9, y: 9, textAnchor: 'middle', dominantBaseline: 'central',
-                  fontSize: 8, fill: 'var(--dsw-alias-fg-tertiary, #777)',
+                  fontSize: 8, style: { fill: 'var(--dsw-alias-label-tertiary)' },
                 }, '?')
                 : null,
         )),
@@ -447,7 +536,7 @@ window.__ModuleLoader__.load({
                   return h('div', { key: `${win.tier}-${index}`, style: { display: 'flex', flexDirection: 'column', gap: 3 } },
                     h('div', { style: { display: 'flex', justifyContent: 'space-between' } },
                       h('span', null, props.t('quota')),
-                      h('strong', { style: { color: empty ? '#d95c5c' : '#4caf78' } }, amount)),
+                      h('strong', { style: { color: empty ? STATUS_COLOR.error : STATUS_COLOR.success } }, amount)),
                     empty ? h('div', { style: { opacity: 0.7 } }, props.t('quotaBalanceEmpty')) : null)
                 }
                 const used = typeof win.usedPercent === 'number'
@@ -465,7 +554,7 @@ window.__ModuleLoader__.load({
                   h('div', {
                     style: {
                       height: 4, borderRadius: 2,
-                      background: 'var(--dsw-alias-border-secondary, #333)',
+                      background: 'var(--dsw-alias-border-l2)',
                       overflow: 'hidden',
                     },
                   }, h('div', {
@@ -526,9 +615,7 @@ window.__ModuleLoader__.load({
           padding: narrow ? '8px 10px' : '4px 8px',
           fontSize: 12,
           borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-secondary, #333)',
-          background: 'var(--dsw-alias-bg-secondary, transparent)',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
+          ...FIELD_SKIN,
           outline: 'none',
         },
       })
@@ -555,9 +642,7 @@ window.__ModuleLoader__.load({
             padding: '5px 8px',
             fontSize: 12,
             borderRadius: 6,
-            border: '1px solid var(--dsw-alias-border-secondary, #333)',
-            background: 'var(--dsw-alias-bg-secondary, transparent)',
-            color: 'var(--dsw-alias-fg-primary, inherit)',
+            ...FIELD_SKIN,
             cursor: 'pointer',
           },
         },
@@ -572,7 +657,7 @@ window.__ModuleLoader__.load({
             marginTop: 6,
             padding: 4,
             borderRadius: 8,
-            border: '1px solid var(--dsw-alias-border-secondary, #333)',
+            border: HAIRLINE_L2,
             display: 'flex',
             flexDirection: 'column',
             gap: 2,
@@ -590,7 +675,7 @@ window.__ModuleLoader__.load({
             padding: '4px 6px',
             borderRadius: 6,
             background: entry.provider === props.value
-              ? 'var(--dsw-alias-bg-tertiary, rgba(128,128,128,0.12))'
+              ? 'var(--dsw-alias-interactive-bg-active)'
               : 'transparent',
           },
         },
@@ -659,9 +744,7 @@ window.__ModuleLoader__.load({
             padding: '3px 8px',
             fontSize: 12,
             borderRadius: 6,
-            border: '1px solid var(--dsw-alias-border-secondary, #333)',
-            background: 'var(--dsw-alias-bg-secondary, transparent)',
-            color: 'var(--dsw-alias-fg-primary, inherit)',
+            ...FIELD_SKIN,
             cursor: 'pointer',
           },
         },
@@ -681,10 +764,10 @@ window.__ModuleLoader__.load({
               : null),
             padding: 4,
             borderRadius: 8,
-            border: '1px solid var(--dsw-alias-border-secondary, #333)',
-            background: 'var(--dsw-alias-bg-primary, #1b1b1f)',
-            color: 'var(--dsw-alias-fg-primary, inherit)',
-            boxShadow: '0 6px 20px rgba(0,0,0,0.4)',
+            border: HAIRLINE_L2,
+            ...OPAQUE_SURFACE_STYLE,
+            color: 'var(--dsw-alias-label-primary)',
+            boxShadow: 'var(--dsw-shadow-lv3)',
             display: 'flex',
             flexDirection: 'column',
             gap: 2,
@@ -700,9 +783,9 @@ window.__ModuleLoader__.load({
             borderRadius: 6,
             border: 'none',
             background: option.value === props.value
-              ? 'var(--dsw-alias-bg-tertiary, rgba(128,128,128,0.12))'
+              ? 'var(--dsw-alias-interactive-bg-active)'
               : 'transparent',
-            color: 'var(--dsw-alias-fg-primary, inherit)',
+            color: 'var(--dsw-alias-label-primary)',
             cursor: 'pointer',
             whiteSpace: 'nowrap',
           },
@@ -858,13 +941,18 @@ window.__ModuleLoader__.load({
         h('div', { style: { flex: 1 } }),
         h(IconButton, { icon: 'refresh', title: t('refresh'), disabled: busy, onClick: () => act('refresh') }))
 
+      // 错误提示:左侧色条标记 + 无底色。
+      // 不用危险色做半透明底:那层红会把错误文字本身的对比度从 4.50/4.77
+      // 拉低到 4.14/3.96,两个主题都跌破 AA;而且亮色下红底与白底的差异
+      // 只有 1.09:1,用户根本看不出这里是一块提示。
+      // 改用 2px 色条:提示块有明确标记,文字仍落在面板底色上,对比度不打折。
       const errorBlock = error
         ? h('div', {
           style: {
             padding: '4px 8px',
-            borderRadius: 6,
-            background: 'var(--dsw-alias-bg-danger, rgba(200,60,60,0.15))',
-            color: 'var(--dsw-alias-fg-danger, #e07070)',
+            borderRadius: 4,
+            borderLeft: '2px solid var(--dsw-alias-state-error-primary)',
+            color: STATUS_COLOR.error,
           },
         }, `${t('error')}: ${error}`)
         : null
@@ -902,7 +990,7 @@ window.__ModuleLoader__.load({
           style: {
             padding: '6px 8px',
             borderRadius: 8,
-            background: 'var(--dsw-alias-bg-tertiary, rgba(128,128,128,0.08))',
+            background: 'var(--dsw-alias-interactive-bg-active)',
             display: 'flex',
             alignItems: 'center',
             gap: 8,
@@ -932,8 +1020,14 @@ window.__ModuleLoader__.load({
             gap: 4,
             padding: '3px 4px',
             borderRadius: 8,
+            // 当前生效行用业务蓝描边。
+            // 不用 button-primary-fill:那是主按钮的填充色(亮色近黑、暗色近白),
+            // 做 1px 整框会盖过行内主按钮,且与「使用」按钮同色互相稀释强调。
+            // 也不用 border-selected(#adb2b8):它在亮色白底上只有 2.13:1,
+            // 达不到非文字 3:1,细线在亮色面板上几乎看不见。
+            // 业务蓝亮 #4176e6 对白底 4.23:1、暗 #7aaaff 对 layer-2 5.99:1,两主题都达标。
             border: key.id === current.activeKeyId && current.unknown === null
-              ? '1px solid var(--dsw-alias-border-accent, #4a6cf7)'
+              ? '1px solid var(--dsw-alias-state-business-primary)'
               : '1px solid transparent',
           }
           if (renaming === key.id) {
@@ -956,22 +1050,22 @@ window.__ModuleLoader__.load({
             title: key.alias,
           }, key.alias + valueNote(key))
           const activeChip = key.id === current.activeKeyId && current.unknown === null
-            ? h(Chip, { label: t('active'), color: 'var(--dsw-alias-fg-tertiary, #999)' })
+            ? h(Chip, { label: t('active'), color: 'var(--dsw-alias-label-tertiary)' })
             : null
           // 健康状态徽章:有效(绿)/限流(黄,含冷却剩余)/无效(红)/未知(灰)。
           // 余额型窗口为 0 时显示"余额不足",避免把"账户没钱"误报成"限流"。
           const keyBalance = balanceWindowOf(quotas[key.id])
           const keyBalanceEmpty = isBalanceEmpty(keyBalance)
           const healthInfo = {
-            ok: { label: t('healthOk'), color: '#4caf78' },
+            ok: { label: t('healthOk'), color: STATUS_COLOR.success },
             limited: {
               label: key.limited
                 ? (keyBalanceEmpty ? t('quotaBalanceEmpty') : `${t('healthLimited')} ${formatReset(key.cooldownUntil)}`)
                 : t('healthOk'),
-              color: keyBalanceEmpty ? '#d95c5c' : '#d9a13c',
+              color: keyBalanceEmpty ? STATUS_COLOR.error : STATUS_COLOR.warn,
             },
-            invalid: { label: t('healthInvalid'), color: '#d95c5c' },
-            unknown: { label: t('healthUnknown'), color: 'var(--dsw-alias-fg-tertiary, #999)' },
+            invalid: { label: t('healthInvalid'), color: STATUS_COLOR.error },
+            unknown: { label: t('healthUnknown'), color: 'var(--dsw-alias-label-tertiary)' },
           }[key.health ?? 'unknown']
           const healthChip = key.limited || key.health === 'invalid' || key.health === 'unknown'
             ? h(Chip, { label: healthInfo.label, color: healthInfo.color })
@@ -1046,8 +1140,8 @@ window.__ModuleLoader__.load({
           fontSize: 12,
           borderRadius: 6,
           border: 'none',
-          background: 'var(--dsw-alias-bg-accent, #4a6cf7)',
-          color: 'var(--dsw-alias-fg-on-accent, #fff)',
+          background: 'var(--dsw-alias-button-primary-fill)',
+          color: 'var(--dsw-alias-label-primary-foreground)',
           cursor: busy || newValue.trim().length === 0 ? 'default' : 'pointer',
           opacity: busy || newValue.trim().length === 0 ? 0.45 : 1,
           whiteSpace: 'nowrap',
@@ -1086,16 +1180,16 @@ window.__ModuleLoader__.load({
           padding: '3px 8px',
           fontSize: 12,
           borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-secondary, #333)',
+          border: HAIRLINE_L2,
           background: 'transparent',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
+          color: 'var(--dsw-alias-label-primary)',
           cursor: 'pointer',
         },
       }, h(Icon, { name: 'plus', size: 12 }), t('batchAdd'))
 
       const batchSummary = batchResult
         ? h('span', {
-          style: { fontSize: 11, color: batchResult.failures.length > 0 ? '#d9a13c' : '#4caf78' },
+          style: { fontSize: 11, color: batchResult.failures.length > 0 ? STATUS_COLOR.warn : STATUS_COLOR.success },
         }, t('batchResult', { added: batchResult.added, failed: batchResult.failures.length }))
         : null
 
@@ -1113,9 +1207,7 @@ window.__ModuleLoader__.load({
               fontSize: 12,
               lineHeight: 1.5,
               borderRadius: 6,
-              border: '1px solid var(--dsw-alias-border-secondary, #333)',
-              background: 'var(--dsw-alias-bg-secondary, transparent)',
-              color: 'var(--dsw-alias-fg-primary, inherit)',
+              ...FIELD_SKIN,
               outline: 'none',
               resize: 'vertical',
               fontFamily: 'inherit',
@@ -1143,8 +1235,8 @@ window.__ModuleLoader__.load({
                 fontSize: 12,
                 borderRadius: 6,
                 border: 'none',
-                background: 'var(--dsw-alias-bg-accent, #4a6cf7)',
-                color: 'var(--dsw-alias-fg-on-accent, #fff)',
+                background: 'var(--dsw-alias-button-primary-fill)',
+                color: 'var(--dsw-alias-label-primary-foreground)',
                 cursor: 'pointer',
                 opacity: batchText.trim().length === 0 ? 0.45 : 1,
               },
@@ -1162,7 +1254,7 @@ window.__ModuleLoader__.load({
                 overflowY: 'auto',
                 padding: '4px 6px',
                 borderRadius: 6,
-                background: 'var(--dsw-alias-bg-tertiary, rgba(128,128,128,0.08))',
+                background: 'var(--dsw-alias-interactive-bg-active)',
                 fontSize: 11,
                 opacity: 0.85,
                 display: 'flex',
@@ -1185,7 +1277,7 @@ window.__ModuleLoader__.load({
       const availableBlock = state && state.available.length > 0
         ? h('div', {
           style: {
-            borderTop: '1px solid var(--dsw-alias-border-secondary, #333)',
+            borderTop: HAIRLINE_L2,
             paddingTop: 8,
             display: 'flex',
             flexDirection: 'column',
@@ -1259,9 +1351,7 @@ window.__ModuleLoader__.load({
               padding: '3px 6px',
               fontSize: 12,
               borderRadius: 6,
-              border: '1px solid var(--dsw-alias-border-secondary, #333)',
-              background: 'var(--dsw-alias-bg-secondary, transparent)',
-              color: 'var(--dsw-alias-fg-primary, inherit)',
+              ...FIELD_SKIN,
               outline: 'none',
             },
           })
@@ -1304,13 +1394,16 @@ window.__ModuleLoader__.load({
           fontSize: 12,
           borderRadius: 6,
           border: 'none',
+          // 激活下划线跟宿主 tab 一致用业务蓝(见宿主 .tabActive::after 的用法)。
+          // 不用 button-primary-fill:那是主按钮填充色,在亮色下是近黑、暗色下近白,
+          // 做下划线既与行内「使用」按钮抢强调,也与上方"当前生效行"的判断相冲突。
           borderBottom: tab === name
-            ? '2px solid var(--dsw-alias-border-accent, #4a6cf7)'
+            ? '2px solid var(--dsw-alias-state-business-primary)'
             : '2px solid transparent',
           background: tab === name
-            ? 'var(--dsw-alias-bg-tertiary, rgba(128,128,128,0.12))'
+            ? 'var(--dsw-alias-interactive-bg-active)'
             : 'transparent',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
+          color: 'var(--dsw-alias-label-primary)',
           cursor: 'pointer',
         },
       }, label)
@@ -1410,10 +1503,10 @@ window.__ModuleLoader__.load({
           zIndex: 60,
           padding: 12,
           borderRadius: 10,
-          border: '1px solid var(--dsw-alias-border-secondary, #333)',
-          background: 'var(--dsw-alias-bg-primary, #1b1b1f)',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
-          boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
+          border: HAIRLINE_L2,
+          ...OPAQUE_SURFACE_STYLE,
+          color: 'var(--dsw-alias-label-primary)',
+          boxShadow: 'var(--dsw-shadow-lv3)',
           display: 'flex',
           flexDirection: 'column',
           gap: 8,
@@ -1442,7 +1535,7 @@ window.__ModuleLoader__.load({
             borderRadius: 8,
             border: 'none',
             background: 'transparent',
-            color: 'var(--dsw-alias-fg-primary, inherit)',
+            color: 'var(--dsw-alias-label-primary)',
             cursor: 'pointer',
           },
         },
@@ -1479,9 +1572,13 @@ window.__ModuleLoader__.load({
           padding: '2px 8px',
           borderRadius: 999,
           fontSize: 11,
-          border: '1px solid var(--dsw-alias-border-accent, #4a6cf7)',
-          color: 'var(--dsw-alias-fg-accent, #7c8cf8)',
-          background: 'var(--dsw-alias-bg-accent, rgba(74,108,247,0.12))',
+          // 文字用宿主专为「蓝底上的正文」准备的 label-primary-bluish:
+          // DSH 默认主题下亮色 #0e3074 于浅蓝底 10.53:1、暗色 #f9fafb 于深蓝底 9.79:1。
+          // 各皮肤会把紫/青底换成自己的色,实测 9.62~12.12,均达标。
+          // 直接用 state-business-primary 当文字色只有 3.60/4.39,11px 不够。
+          border: '1px solid var(--dsw-alias-state-business-primary)',
+          color: 'var(--dsw-alias-label-primary-bluish)',
+          background: 'var(--dsw-alias-state-business-tertiary)',
         },
         title: t('managedHint'),
       },
@@ -1608,9 +1705,7 @@ window.__ModuleLoader__.load({
         padding: '3px 6px',
         fontSize: 12,
         borderRadius: 6,
-        border: '1px solid var(--dsw-alias-border-secondary, #333)',
-        background: 'var(--dsw-alias-bg-secondary, transparent)',
-        color: 'var(--dsw-alias-fg-primary, inherit)',
+        ...FIELD_SKIN,
         outline: 'none',
       }
       // 区块标题行:展开平铺,不再折叠,只做静态标题。
@@ -1631,7 +1726,7 @@ window.__ModuleLoader__.load({
       const children = [header]
       {
         if (error) {
-          children.push(h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, error))
+          children.push(h('div', { style: { color: STATUS_COLOR.error } }, error))
         }
         if (values === null) {
           // 拉取失败时不再并排显示"加载中…":两者同时出现会让人以为还在等。
@@ -1705,7 +1800,7 @@ window.__ModuleLoader__.load({
             }
             children.push(h('div', { style: { fontSize: 12, opacity: probing !== null ? 0.9 : 0.55 } }, statusText))
           }
-          if (saved) children.push(h('span', { style: { color: '#4caf78' } }, t('configSaved')))
+          if (saved) children.push(h('span', { style: { color: STATUS_COLOR.success } }, t('configSaved')))
         }
       }
       return h('div', {
@@ -1713,7 +1808,7 @@ window.__ModuleLoader__.load({
           display: 'flex',
           flexDirection: 'column',
           gap: 6,
-          borderTop: '1px solid var(--dsw-alias-border-secondary, #333)',
+          borderTop: HAIRLINE_L2,
           paddingTop: 8,
         },
       }, children)
@@ -1887,9 +1982,7 @@ window.__ModuleLoader__.load({
           padding: '3px 6px',
           fontSize: 12,
           borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-secondary, #333)',
-          background: 'var(--dsw-alias-bg-secondary, transparent)',
-          color: 'var(--dsw-alias-fg-primary, inherit)',
+          ...FIELD_SKIN,
           outline: 'none',
         },
       })
@@ -1919,10 +2012,10 @@ window.__ModuleLoader__.load({
       const statusLine = status === null || (status.lastRunAt ?? 0) === 0
         ? h('div', { style: { opacity: 0.6 } }, t('backupNever'))
         : status.ok === true
-          ? h('div', { style: { color: '#4caf78' } },
+          ? h('div', { style: { color: STATUS_COLOR.success } },
             `${t('backupLastOk')} ${new Date(status.lastRunAt).toLocaleString()}`
             + ((status.deletedFailures?.length ?? 0) > 0 ? ` · ${t('backupCleanupWarn')}` : ''))
-          : h('div', { style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } },
+          : h('div', { style: { color: STATUS_COLOR.error } },
             `${t('backupLastFail')}: ${status.error ?? t('unknownError')}`)
 
       // 区块标题行:展开平铺,不再折叠,只做静态标题。
@@ -1942,10 +2035,10 @@ window.__ModuleLoader__.load({
       const children = [header, statusLine]
       {
         if (error) {
-          children.push(h('div', { role: 'alert', style: { color: 'var(--dsw-alias-fg-danger, #e07070)' } }, `${t('error')}: ${error}`))
+          children.push(h('div', { role: 'alert', style: { color: STATUS_COLOR.error } }, `${t('error')}: ${error}`))
         }
         if (restored) {
-          children.push(h('div', { role: 'status', style: { color: '#4caf78' } }, t('backupRestoredOk')))
+          children.push(h('div', { role: 'status', style: { color: STATUS_COLOR.success } }, t('backupRestoredOk')))
         }
         if (values === null) {
           if (error === '') children.push(h('div', { style: { opacity: 0.7 } }, t('loading')))
@@ -1989,15 +2082,15 @@ window.__ModuleLoader__.load({
                 fontSize: 12,
                 borderRadius: 6,
                 border: 'none',
-                background: 'var(--dsw-alias-bg-accent, #4a6cf7)',
-                color: 'var(--dsw-alias-fg-on-accent, #fff)',
+                background: 'var(--dsw-alias-button-primary-fill)',
+                color: 'var(--dsw-alias-label-primary-foreground)',
                 cursor: busy ? 'default' : 'pointer',
                 opacity: busy ? 0.45 : 1,
               },
             }, t('backupNowBtn')),
-            restored ? null : (saved ? h('span', { style: { color: '#4caf78' } }, t('configSaved')) : null)))
+            restored ? null : (saved ? h('span', { style: { color: STATUS_COLOR.success } }, t('configSaved')) : null)))
           // 云端备份列表:每行 = 设备 + 时间 + 恢复按钮。
-          children.push(h('div', { style: { borderTop: '1px solid var(--dsw-alias-border-secondary, #333)', paddingTop: 6 } },
+          children.push(h('div', { style: { borderTop: HAIRLINE_L2, paddingTop: 6 } },
             h('div', { style: { opacity: 0.8, marginBottom: 4 } }, `${t('backupListTitle')}:`),
             backups === null
               ? h('div', { style: { opacity: 0.7 } }, t('loading'))
@@ -2042,7 +2135,7 @@ window.__ModuleLoader__.load({
           display: 'flex',
           flexDirection: 'column',
           gap: 6,
-          borderTop: '1px solid var(--dsw-alias-border-secondary, #333)',
+          borderTop: HAIRLINE_L2,
           paddingTop: 8,
         },
       }, children)
@@ -2307,7 +2400,7 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       apply(ctx) {
         // 构建标记:控制台可确认页面加载的是哪一代客户端代码。
-        console.info('[dsh-key-managment] client build 2026-11-15.2 (confirm-popover-t-fallback + panel-level-safe-slot)')
+        console.info('[dsh-key-managment] client build 2026-11-27.1 (theme-token-fix + opaque-panel-3x-stack)')
 
         // 全局错误捕获:任何未捕获异常/拒绝都打上插件标记,便于定位崩溃点。
         ctx.effect(() => {
